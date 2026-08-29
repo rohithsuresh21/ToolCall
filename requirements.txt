@@ -1,0 +1,14 @@
+# core pipeline (CPU-only: task generation, tools, agent loop, eval, data build)
+# --- no third-party requirements at all. that is deliberate: the harness must
+# --- run and be debuggable on a laptop before any GPU is billed.
+
+# training / serving (install on the GPU box only)
+torch>=2.4
+transformers>=4.51          # Qwen3 support
+accelerate>=0.34
+peft>=0.13
+datasets>=2.20
+bitsandbytes>=0.43          # optional: 8-bit optimiser for full 4B fine-tune
+vllm>=0.6.3                 # rollouts + fast eval
+openai>=1.40                # teacher / OpenAI-compatible endpoints
+modal>=0.64                 # only if you use scripts/modal_app.py

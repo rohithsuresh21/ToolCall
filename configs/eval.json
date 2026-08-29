@@ -1,0 +1,9 @@
+{
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "max_new_tokens": 512,
+  "max_steps": 10,
+  "repeat_guard": 0,
+  "n_per_type": 20,
+  "_comment": "F10 frozen evaluation configuration. Consumed by the GRPO dev canary, atr.cli eval/collect defaults, and scripts/modal_app.py eval_dev. CLI flags override these when passed explicitly."
+}
