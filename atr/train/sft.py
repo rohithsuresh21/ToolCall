@@ -50,7 +50,7 @@ class SFTConfig:
     lora_targets: tuple = ("q_proj", "k_proj", "v_proj", "o_proj",
                            "gate_proj", "up_proj", "down_proj")
     bf16: bool = True
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
     seed: int = 0
     eval_frac: float = 0.02
     save_steps: int = 200
@@ -171,7 +171,6 @@ def main(cfg: SFTConfig):
         num_train_epochs=cfg.epochs,
         learning_rate=cfg.lora_lr if cfg.lora else cfg.lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=cfg.warmup_ratio,
         weight_decay=cfg.weight_decay,
         bf16=cfg.bf16,
         gradient_checkpointing=cfg.gradient_checkpointing,
