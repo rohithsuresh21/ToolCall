@@ -183,7 +183,6 @@ def main(cfg: SFTConfig):
         report_to=[],
         seed=cfg.seed,
         remove_unused_columns=False,
-        group_by_length=False,
     )
     trainer = T(model=model, args=args, train_dataset=train_ds, eval_dataset=eval_ds,
                 data_collator=lambda b: collate(b, tok.pad_token_id))
