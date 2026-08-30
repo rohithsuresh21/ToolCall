@@ -1,0 +1,20 @@
+# Pinned, known-good stack for training (Colab / cloud / laptop).
+# The repo was written and verified against these versions. Newer releases break
+# the LoRA + gradient-checkpointing + Qwen3 path (see history of OOM / detach
+# errors). Install with:
+#     pip install -U -r requirements-colab.txt
+#
+# IMPORTANT (Colab): uninstall the pre-installed torchao first, it conflicts:
+#     pip uninstall -y torchao transformers peft
+#     pip install -U -r requirements-colab.txt
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.4.1
+torchao==0.18.0
+transformers==4.46.3
+accelerate==0.34.2
+peft==0.13.2
+datasets==3.0.1
+bitsandbytes==0.43.3
+# core pipeline (no GPU) needs nothing extra beyond stdlib

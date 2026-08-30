@@ -150,7 +150,7 @@ def main(cfg: SFTConfig):
     train_ds, eval_ds = build_dataset(cfg, tok)
 
     model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_id, torch_dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
+        cfg.model_id, dtype=torch.bfloat16 if cfg.bf16 else torch.float32,
         attn_implementation="sdpa")
     model.config.use_cache = False
 
