@@ -23,8 +23,9 @@ from __future__ import annotations
 import random
 from typing import Callable
 
+from ..tools.adapter import get_registry
 from ..tools.world import World, build_world
-from .schema import Task
+from .schema import Task, norm_text
 
 # The only tool in the benchmark contract.
 ALL_TOOLS = ["search"]
@@ -153,7 +154,7 @@ def _pick(rng: random.Random, variants: list[str]) -> str:
     return rng.choice(variants)
 
 
-def gen_no_tool(rng: random.Random, w: World, seed: int) -> Task:
+def gen_no_tool(rng: random.Random, w: World, seed: int, **kw) -> Task:
     q, gold = rng.choice(NO_TOOL_BANK)
     return Task(
         task_id=_tid("notool", seed), seed=seed, prompt=q, task_type="no_tool", difficulty=0,
@@ -211,25 +212,38 @@ _LEAF_ATTR = {
 # route templates by hop count: each is a list of _REL keys. Any leaf kind that
 # the route reaches is valid as long as _LEAF_ATTR covers it, so the builder
 # picks a terminal attribute present on the leaf.
-_ROUTES = {
+#
+# PART 2 (route-shape holdout): split into TRAIN and DEV_ONLY pools. Exactly one
+# structurally-distinct shape per hop count is held out exclusively for dev so the
+# dev set exercises a chain the training never saw -- the point being that dev
+# score then requires generalising the *shape*, not memorising it. We deliberately
+# hold out the routes that resolve to a DIFFERENT leaf kind (country) than the
+# majority, and avoid holding out the near-duplicate 3-hop "var B" entry (which is
+# functionally identical to another 3-hop route, so holding it out would test
+# nothing). `_ROUTES` remains the union so legacy callers that pass a bare `hops`
+# keep working.
+_ROUTES_TRAIN = {
     2: [
         ["feature_country", "country_city"],          # leaf city
         ["person_org", "org_city"],                   # leaf city
-        ["org_city", "city_country"],                 # leaf country
         ["work_person", "person_city"],               # leaf city
     ],
     3: [
         ["feature_country", "country_city", "city_country"],   # leaf country
         ["person_org", "org_city", "city_country"],            # leaf country
-        ["work_person", "person_org", "org_city"],             # leaf city
         ["feature_country", "country_city", "city_country"],   # leaf country (var B)
     ],
     4: [
         ["feature_country", "country_city", "city_country", "country_city"],   # leaf city
         ["person_org", "org_city", "city_country", "country_city"],            # leaf city
-        ["work_person", "person_org", "org_city", "city_country"],             # leaf country
     ],
 }
+_ROUTES_DEV_ONLY = {
+    2: [["org_city", "city_country"]],                # leaf country (only 2-hop country leaf)
+    3: [["work_person", "person_org", "org_city"]],   # leaf city (only 3-hop city leaf)
+    4: [["work_person", "person_org", "org_city", "city_country"]],            # leaf country
+}
+_ROUTES = {h: _ROUTES_TRAIN[h] + _ROUTES_DEV_ONLY[h] for h in (2, 3, 4)}
 
 
 def _ent_kind(w: World, name: str) -> str | None:
@@ -271,6 +285,39 @@ def _resolve_chain(w: World, rng: random.Random, steps: list[str]) -> list[dict]
     return None
 
 
+# --- shortcut / disconnection filter (MuSiQue Disconnection Filtering, TACL 2022) ---
+# A multi-hop question is a "disconnected shortcut" when a single, un-chained BM25
+# search -- the exact lazy move -- already surfaces the gold answer. We test this
+# with the SAME `search` tool the agent uses (not a separate index, not an LLM):
+# fire one search with the full question text and check whether the top-K returned
+# passage text already contains the gold answer value. If it does, the question is
+# shortcut-solvable and gets rejected, so the remaining pool genuinely requires
+# chaining. Empirically ~10% of naive chains trip this, so it is a real, worth-
+# filtering leak rather than dead code.
+_SHORTCUT_STATS = {"checked": 0, "rejected": 0}
+
+
+def _norm_find(gold: dict) -> str:
+    """Normalised gold value to search for inside passage text."""
+    return norm_text(_gold_as_answer(gold))
+
+
+def _is_shortcut_solvable(w: World, prompt: str, gold: dict) -> bool:
+    """True if ONE BM25 `search` on the full question text already returns a passage
+    whose text contains the gold answer -- i.e. an un-chained search would solve it."""
+    reg = get_registry("builtin")
+    res = reg.call(w, "search", {"query": prompt, "top_k": 3})
+    if res.get("num_results", 0) == 0:
+        return False
+    want = _norm_find(gold)
+    if not want:
+        return False
+    for hit in res.get("results", []):
+        if want in norm_text(hit.get("text", "")):
+            return True
+    return False
+
+
 def _leaf_attr_choice(w: World, rng: random.Random, leaf: dict) -> tuple[str, dict]:
     """Pick a terminal attribute present on the leaf passage."""
     opts = _LEAF_ATTR.get(leaf["kind"], {})
@@ -305,17 +352,30 @@ def _build_route_oracle(steps: list[str], chain: list[dict]) -> list[dict]:
     return plan
 
 
-def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: str) -> Task | None:
-    routes = list(_ROUTES[hops])   # copy: shuffle mutates in place
+def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: str,
+                filter_shortcuts: bool = True, route_pool: str = "train") -> Task | None:
+    pool = (_ROUTES_TRAIN if route_pool == "train" else _ROUTES_DEV_ONLY)[hops]
+    routes = list(pool)              # copy: shuffle mutates in place
     rng.shuffle(routes)
     for steps in routes:
         chain = _resolve_chain(w, rng, steps)
         if chain is None:
             continue
+        # A "bridge" is every entity in the chain except the final leaf.
+        bridge_ids = [ent["id"] for ent in chain[:-1]]
         leaf = chain[-1]
         attr_word, gold, answer = _leaf_attr_choice(w, rng, leaf)
         phrase = _phrase_chain(steps, chain)
         prompt = f"What is the {attr_word}of {phrase}?"
+        if filter_shortcuts:
+            # Reject if one un-chained BM25 `search` on the FULL question text
+            # already surfaces the gold answer (MuSiQue disconnection filtering).
+            # Count the attempt regardless of outcome so the rejection rate is
+            # observable.
+            _SHORTCUT_STATS["checked"] += 1
+            if _is_shortcut_solvable(w, prompt, gold):
+                _SHORTCUT_STATS["rejected"] += 1
+                continue
         plan = _build_route_oracle(steps, chain)
         return Task(
             task_id=_tid(task_type, seed), seed=seed, prompt=prompt,
@@ -328,16 +388,16 @@ def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: s
     return None
 
 
-def gen_2hop(rng, w, seed):
-    return gen_musique(w, rng, seed, 2, "musique_2hop") or gen_no_tool(rng, w, seed)
+def gen_2hop(rng, w, seed, **kw):
+    return gen_musique(w, rng, seed, 2, "musique_2hop", **kw) or gen_no_tool(rng, w, seed)
 
 
-def gen_3hop(rng, w, seed):
-    return gen_musique(w, rng, seed, 3, "musique_3hop") or gen_no_tool(rng, w, seed)
+def gen_3hop(rng, w, seed, **kw):
+    return gen_musique(w, rng, seed, 3, "musique_3hop", **kw) or gen_no_tool(rng, w, seed)
 
 
-def gen_4hop(rng, w, seed):
-    return gen_musique(w, rng, seed, 4, "musique_4hop") or gen_no_tool(rng, w, seed)
+def gen_4hop(rng, w, seed, **kw):
+    return gen_musique(w, rng, seed, 4, "musique_4hop", **kw) or gen_no_tool(rng, w, seed)
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +406,7 @@ def gen_4hop(rng, w, seed):
 FAKE_PRODUCTS = ["Zephyr Vale", "The Obsidian Cipher", "Karnovsky Aeronautics"]
 
 
-def gen_unanswerable(rng: random.Random, w: World, seed: int) -> Task:
+def gen_unanswerable(rng: random.Random, w: World, seed: int, **kw) -> Task:
     fake = rng.choice(FAKE_PRODUCTS)
     style = rng.choice(["founded", "population", "location", "work"])
     if style == "founded":
@@ -401,12 +461,20 @@ TASK_TIERS: dict[str, int] = {
 
 
 def generate(n: int, seed_start: int = 0, mix: dict[str, float] | None = None,
-             rng_seed: int = 0) -> list[Task]:
+             rng_seed: int = 0, filter_shortcuts: bool = True,
+             text_loader=None) -> list[Task]:
     """
     Mint `n` tasks from seeds [seed_start, seed_start + n).
 
     Use DISJOINT seed ranges for train and eval. The world is a pure function of
     the seed, so overlapping ranges leak gold answers directly.
+
+    Train generation uses the train route pool only (route_pool="train"), so a
+    held-out dev route shape can never appear here.
+
+    `text_loader` is the Part A opt-in hook: pass
+    load_naturalized_loader(CACHE) to build worlds with natural, varied passage
+    prose (facts/gold unchanged) instead of the fixed templates.
     """
     mix = mix or DEFAULT_MIX
     kinds = list(mix)
@@ -416,23 +484,28 @@ def generate(n: int, seed_start: int = 0, mix: dict[str, float] | None = None,
     for i in range(n):
         seed = seed_start + i
         kind = picker.choices(kinds, weights=weights, k=1)[0]
-        w = build_world(seed)
+        w = build_world(seed, text_loader=text_loader)
         rng = random.Random(seed * 7919 + 13)
-        task = GENERATORS[kind](rng, w, seed)
+        task = GENERATORS[kind](rng, w, seed, filter_shortcuts=filter_shortcuts)
         task.tier = max(TASK_TIERS[kind], _chain_len(task))
         tasks.append(task)
     return tasks
 
 
-def dev_set(n_per_type: int = 6, seed_start: int = 900_000) -> list[Task]:
-    """A balanced, reproducible development set: equal weight per family."""
+def dev_set(n_per_type: int = 6, seed_start: int = 900_000, text_loader=None) -> list[Task]:
+    """A balanced, reproducible development set: equal weight per family. Uses the
+    DEV route pool so each multi-hop family is guaranteed to include its held-out
+    dev-only shape (the ones excluded from train).
+
+    `text_loader` is the Part A opt-in hook to build dev worlds with natural,
+    varied passage prose (see generate())."""
     tasks: list[Task] = []
     seed = seed_start
     for kind, fn in GENERATORS.items():
         made = 0
         while made < n_per_type:
-            w = build_world(seed)
-            t = fn(random.Random(seed * 7919 + 13), w, seed)
+            w = build_world(seed, text_loader=text_loader)
+            t = fn(random.Random(seed * 7919 + 13), w, seed, route_pool="dev")
             if t.task_type != kind:
                 # fallback substitution (gen_*_hop can degrade to no_tool); keep going
                 tasks.append(t)

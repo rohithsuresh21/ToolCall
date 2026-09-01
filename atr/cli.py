@@ -9,6 +9,7 @@ from pathlib import Path
 from .agent.backends import SamplingParams, load_backend
 from .agent.loop import LoopConfig
 from .data.build_sft import ExportConfig, export
+from .data.naturalize import load_naturalized_loader
 from .data.rejection import FilterConfig, filter_and_balance
 from .data.teacher import collect, dump, load
 from .eval.harness import (aggregate, evaluate, format_report, load_eval_config,
@@ -20,9 +21,10 @@ from .tasks.schema import Task
 def _tasks_from(args) -> list[Task]:
     if getattr(args, "tasks", None):
         return [Task.from_dict(json.loads(l)) for l in Path(args.tasks).read_text().splitlines() if l.strip()]
+    loader = load_naturalized_loader(args.cache) if getattr(args, "cache", None) else None
     if getattr(args, "dev", False):
-        return dev_set(args.n_per_type or load_eval_config()["n_per_type"])
-    return generate(args.n, seed_start=args.seed_start)
+        return dev_set(args.n_per_type or load_eval_config()["n_per_type"], text_loader=loader)
+    return generate(args.n, seed_start=args.seed_start, text_loader=loader)
 
 
 def _backend(args):
@@ -66,7 +68,8 @@ def cmd_eval(args):
     be = oracle_backend(tasks) if args.backend == "oracle" else _backend(args)
     cards, trajs = evaluate(
         tasks, be, env=args.env,
-        cfg=LoopConfig(max_steps=fz["max_steps"], repeat_guard=fz["repeat_guard"]),
+        cfg=LoopConfig(max_steps=fz["max_steps"], repeat_guard=fz["repeat_guard"],
+                       text_loader=load_naturalized_loader(args.cache) if args.cache else None),
         sp=SamplingParams(temperature=fz["temperature"], max_tokens=fz["max_new_tokens"]),
         batch_size=args.batch_size, strict_necessity=not args.loose_necessity,
         strict_match=args.strict_match)
@@ -83,7 +86,8 @@ def cmd_collect(args):
     tasks = _tasks_from(args)
     be = oracle_backend(tasks) if args.backend == "oracle" else _backend(args)
     recs = collect(tasks, be, env=args.env,
-                   cfg=LoopConfig(max_steps=fz["max_steps"]),
+                   cfg=LoopConfig(max_steps=fz["max_steps"],
+                                  text_loader=load_naturalized_loader(args.cache) if args.cache else None),
                    sp=SamplingParams(temperature=fz["temperature"],
                                      max_tokens=fz["max_new_tokens"]),
                    samples_per_task=args.samples_per_task, batch_size=args.batch_size)
@@ -117,7 +121,8 @@ def cmd_ablate(args):
     """
     tasks = _tasks_from(args)
     fz = _frozen(args)
-    cfg = LoopConfig(max_steps=fz["max_steps"])
+    cfg = LoopConfig(max_steps=fz["max_steps"],
+                     text_loader=load_naturalized_loader(args.cache) if args.cache else None)
     rows = []
 
     def run(label, corrupt):
@@ -162,6 +167,9 @@ def main(argv=None):
 
     def common(sp, backend_default="oracle"):
         sp.add_argument("--tasks", help="jsonl of tasks (overrides --n/--dev)")
+        sp.add_argument("--cache", default=None,
+                        help="naturalized-passage cache (Part A); if present, builds "
+                             "worlds with natural prose instead of templates")
         sp.add_argument("--dev", action="store_true", help="use the balanced dev set")
         sp.add_argument("--n-per-type", type=int, default=None,
                         help="default: configs/eval.json n_per_type")

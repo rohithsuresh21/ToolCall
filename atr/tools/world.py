@@ -97,7 +97,14 @@ def _uniq_names(rng: random.Random, n: int) -> list[str]:
     return out
 
 
-def build_world(seed: int) -> World:
+def build_world(seed: int, text_loader=None) -> World:
+    """Build the deterministic seeded world.
+
+    `text_loader` is an OPT-IN hook (Part A naturalization): a callable
+    (seed:int, doc_id:str) -> str|None that supplies cached, naturally-varied
+    passage prose. When it returns text for a doc, that text replaces the templated
+    _passage() rendering; the entity `attrs` dict (and thus gold answers and every
+    verifier) is never touched. Default None keeps the fixed templated prose."""
     rng = random.Random(seed)
     w = World(seed=seed)
 
@@ -179,7 +186,17 @@ def build_world(seed: int) -> World:
         w.id_index[e["name"].lower()] = e
 
     # ---- build document passages from entities ------------------------------
-    w.documents = [_passage(e, w) for e in entities]
+    if text_loader is not None:
+        w.documents = []
+        for e in entities:
+            d = _passage(e, w)
+            nat = text_loader(seed, d["doc_id"])
+            if nat:
+                d["text"] = nat
+                d["naturalized"] = True
+            w.documents.append(d)
+    else:
+        w.documents = [_passage(e, w) for e in entities]
     return w
 
 
