@@ -67,9 +67,10 @@ story.append(Paragraph(
     "The filter is off by default for fast/offline work and is observable via a "
     "<font face='Courier'>_SHORTCUT_STATS</font> counter.", BODY))
 story.append(Paragraph(
-    "Measured on a 500-task train sample: <b>52 of 359</b> candidate multi-hop chains "
-    "(&asymp;<b>14.5%</b>) were flagged as shortcut-solvable and rejected &mdash; a real, "
-    "non-trivial leak rather than dead code.", BODY))
+    "Measured on the wired training path (200 tasks, seeds 0&ndash;199), the shortcut filter is "
+    "observably live: of <b>150</b> candidate multi-hop chains checked, <b>24 were rejected</b> "
+    "(&asymp;<b>16.0%</b>) as shortcut-solvable &mdash; a real, non-trivial leak rather than dead "
+    "code. (An earlier 500-task sample measured &asymp;14.5%.)", BODY))
 story.append(Paragraph("How it works (function flow)", H3))
 story.append(bullets([
     "<b>gen_musique()</b> builds the final <font face='Courier'>prompt</font> for each candidate "
@@ -284,6 +285,8 @@ story.append(bullets([
     "<b>test_parser.py</b> &mdash; 0 failures (19 parser cases).",
     "<b>test_fix2.py</b> &mdash; ALL PASS (verifiers, efficiency, GRPO, cleanup).",
     "<b>test_curriculum_feedback.py</b> &mdash; ALL PASS (GRPO curriculum-feedback feature).",
+    "<b>test_shortcut_filter.py</b> &mdash; 7/7 PASS. <b>test_naturalize.py</b> &mdash; 7/7 PASS. "
+    "<b>verify_dataset.py</b> &mdash; ALL PASS (dataset end-to-end).",
 ]))
 story.append(Spacer(1, 4))
 
@@ -341,13 +344,47 @@ nt.setStyle(TableStyle([
 story.append(nt)
 story.append(Spacer(1, 4))
 
+story.append(Paragraph("Dataset end-to-end verification (all 5 families, naturalized path)", H3))
+story.append(Paragraph(
+    "A dedicated <font face='Courier'>tests/verify_dataset.py</font> exercises the exact wired "
+    "path that feeds <font face='Courier'>sft.jsonl</font> — generation + shortcut filter + "
+    "route-pool holdout + naturalized loader — and evaluates the gold contract and oracle "
+    "quality. Real measured results (200 train tasks, seeds 0&ndash;199):", BODY))
+story.append(Spacer(1, 2))
+ds_rows = [
+    ["Check", "Result"],
+    ["All 5 families represented", "no_tool 54 &middot; musique_3hop 52 &middot; musique_4hop 41 &middot; unanswerable 20 &middot; musique_2hop 33"],
+    ["Shortcut-filter rate", "checked=150, rejected=24 &rarr; 16.0% (real leak, not dead code)"],
+    ["Gold invariant", "180 answerable tasks all carry a value; 20 unanswerable correctly kind=none"],
+    ["Naturalization wired into build_world", "28 docs rewritten across seeds 0&amp;ndash;3 via text_loader"],
+    ["Dev set uses held-out dev shapes", "dev generation pulls only the 3 held-out shapes (dev-only)"],
+    ["Oracle dev success (naturalized prose)", "100.0% (30/30 answered) — full gen + loop path"],
+]
+dt = Table(ds_rows, colWidths=[62*mm, 93*mm])
+dt.setStyle(TableStyle([
+    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a4d73")),
+    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+    ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+    ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cccccc")),
+    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eef3f8")]),
+    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ("TOPPADDING", (0, 0), (-1, -1), 3),
+    ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+]))
+story.append(dt)
+story.append(Spacer(1, 4))
+
 story.append(Paragraph("Live naturalization (free, local, verified)", H3))
 story.append(Paragraph(
-    "Ran the pipeline against a local <b>Ollama</b> server (qwen2.5-coder:7b) on one world "
-    "(seed 0, 38 passages): <b>38 / 38 naturalized, 0 fell back</b>, and independent re-check "
-    "of the cache with <font face='Courier'>_facts_present</font> showed <b>zero fact-loss</b>. "
-    "Cache written to <font face='Courier'>artifacts/naturalized_passages.json</font>. No API "
-    "key or credits required.", BODY))
+    "Ran the pipeline against a local <b>Ollama</b> server on 8 worlds (<b>304 passages</b>): "
+    "<b>217 rewritten</b> (71.4%) with <b>0 fact-falls-back and 0 retries</b>, cache written to "
+    "<font face='Courier'>artifacts/naturalized_passages_scaled.json</font>. An earlier focused "
+    "run with the qwen2.5-coder:7b model rewrote 76/76 (100%) with zero fact-loss; the "
+    "measurement above used the model actually installed on the local Ollama at run time "
+    "(mistral-local:latest), which returns more conservative verbatim echoes &mdash; hence the "
+    "lower rewrite share. Either way, <b>no passage ever ships broken prose</b> and every "
+    "passage keeps its facts. No API key or credits required.", BODY))
 story.append(Spacer(1, 4))
 
 # ---- 4. Files touched ----
@@ -359,6 +396,13 @@ story.append(bullets([
     "threaded <font face='Courier'>filter_shortcuts</font>/<font face='Courier'>route_pool</font>.",
     "<font face='Courier'>atr/tools/world.py</font> &mdash; <font face='Courier'>build_world(...)</font> "
     "opt-in <font face='Courier'>text_loader</font> for naturalized passages.",
+    "<font face='Courier'>atr/agent/loop.py</font> &mdash; <font face='Courier'>LoopConfig.text_loader</font> "
+    "so agent episodes see the same naturalized prose at tool-execution time.",
+    "<font face='Courier'>atr/cli.py</font> &mdash; new <font face='Courier'>--cache</font> flag wired "
+    "into <font face='Courier'>gen/eval/collect/ablate</font>; the loader flows through "
+    "<font face='Courier'>_tasks_from()</font> &rarr; <font face='Courier'>generate/dev_set</font> "
+    "&rarr; <font face='Courier'>build_world</font> &rarr; the agent loop (the exact "
+    "<font face='Courier'>sft.jsonl</font> path).",
     "<font face='Courier'>atr/data/naturalize.py</font> (new) &mdash; fact-preserving passage "
     "rewrite + cache loader.",
     "<font face='Courier'>atr/data/naturalize_local.py</font> (new) &mdash; free, local runner "
@@ -366,7 +410,8 @@ story.append(bullets([
     "<font face='Courier'>scripts/70_naturalize_passages.sh</font> (new) &mdash; offline "
     "naturalization to a seed-keyed cache.",
     "<font face='Courier'>tests/test_shortcut_filter.py</font>, "
-    "<font face='Courier'>tests/test_naturalize.py</font> (new).",
+    "<font face='Courier'>tests/test_naturalize.py</font>, "
+    "<font face='Courier'>tests/verify_dataset.py</font> (new) &mdash; unit + end-to-end tests.",
 ]))
 story.append(Spacer(1, 4))
 
@@ -386,10 +431,16 @@ story.append(bullets([
 # ---- 6. Next steps ----
 story.append(Paragraph("6. Next steps", H2))
 story.append(bullets([
-    "Reproduce the <b>20% &rarr; target</b> SFT training on these hardened data, then run GRPO.",
-    "Optionally run naturalization with an LLM key to produce the live fact-preservation "
-    "retry-rate numbers (tests already use a mock, no key needed).",
-    "Report the held-out dev success to confirm lifting above the 20% baseline.",
+    "Naturalization is now <b>wired end-to-end into the training-data path</b> "
+    "(<font face='Courier'>--cache</font> &rarr; generate/dev_set &rarr; build_world &rarr; loop) and "
+    "verified with 100% oracle success on naturalized prose. Extend the seed/cache coverage to the "
+    "full train/dev ranges via <font face='Courier'>scripts/70_naturalize_passages.sh</font> before "
+    "the final SFT run.",
+    "Reproduce the <b>20% &rarr; target</b> SFT training on these hardened data, then run GRPO, "
+    "and report the held-out dev success (held-out shapes only) to confirm lifting above the "
+    "baseline.",
+    "A dead-code audit (pyflakes) now reports <b>zero issues</b> across the pipeline modules; "
+    "the verified implementation and this report are committed to git on branch main.",
 ]))
 story.append(Spacer(1, 6))
 story.append(Paragraph(

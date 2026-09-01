@@ -28,7 +28,6 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
 
 # --- surface-form pools (span across the encyclopedic domains, not logistics) --
 PERSON_FIRST = ["Ada", "Bo", "Chen", "Divya", "Eli", "Farid", "Gita", "Hana",

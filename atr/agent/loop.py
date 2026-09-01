@@ -23,7 +23,7 @@ from typing import Any, Sequence
 from ..tools.registry import ToolRegistry
 from ..tools.world import World, build_world
 from .backends import Backend, SamplingParams
-from .parser import ParsedTurn, ToolCall, parse_turn
+from .parser import ParsedTurn, parse_turn
 from .prompt import build_messages
 
 

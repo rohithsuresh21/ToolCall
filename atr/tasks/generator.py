@@ -362,7 +362,6 @@ def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: s
         if chain is None:
             continue
         # A "bridge" is every entity in the chain except the final leaf.
-        bridge_ids = [ent["id"] for ent in chain[:-1]]
         leaf = chain[-1]
         attr_word, gold, answer = _leaf_attr_choice(w, rng, leaf)
         phrase = _phrase_chain(steps, chain)
