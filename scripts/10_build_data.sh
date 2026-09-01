@@ -5,17 +5,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 TEACHER="${TEACHER:-oracle}"
-N="${N:-4000}"
+N="${N:-40}"            # matches the naturalized seed range (sweet spot); set higher once the cache covers more
+CACHE="${CACHE:-artifacts/naturalized_passages.json}"
 mkdir -p artifacts
 
-# 1. oracle replays: cheap, perfect, teaches format and tool selection
+# 1. oracle replays: cheap, perfect, teaches format and tool selection.
+#    --cache wires the naturalized passages in so tool-execution prose is varied,
+#    not the fixed templates (facts/gold unchanged).
 python3 -m atr.cli collect --n "$N" --seed-start 0 --backend oracle \
-    --samples-per-task 1 --out artifacts/raw_oracle.jsonl
+    --cache "$CACHE" --samples-per-task 1 --out artifacts/raw_oracle.jsonl
 
 # 2. teacher rollouts on the hard slice: this is where deliberation comes from
 if [ "$TEACHER" != "oracle" ]; then
   python3 -m atr.cli collect --n "$((N/2))" --seed-start 500000 --backend "$TEACHER" \
-      --samples-per-task 4 --temperature 0.8 --out artifacts/raw_teacher.jsonl
+      --cache "$CACHE" --samples-per-task 4 --temperature 0.8 --out artifacts/raw_teacher.jsonl
 fi
 
 # 3. filter + export.  --strict-format only once round 1 has taught the format.

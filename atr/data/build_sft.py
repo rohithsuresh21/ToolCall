@@ -128,7 +128,7 @@ def export(records: Sequence[tuple[Task, Trajectory, ScoreCard]], path: str | Pa
     path.parent.mkdir(parents=True, exist_ok=True)
     n_written, n_skipped = 0, 0
     turn_hist: dict[int, int] = {}
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         for t, j, _ in records:
             rec = trajectory_to_record(t, j, cfg, env)
             if rec is None:

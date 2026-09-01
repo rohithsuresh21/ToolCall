@@ -127,6 +127,7 @@ def naturalize_passage(passage: dict, llm_client) -> dict:
         new_text = _call_llm(llm_client, _build_prompt(passage)).strip() or original
         if _facts_present(passage, new_text):
             out["text"] = new_text
+            out["naturalized"] = True
             return out
     # exhausted retries: ship the known-good templated text rather than a broken one
     out["text"] = original
@@ -149,12 +150,35 @@ def naturalize_passages(world, llm_client) -> dict:
             if nd.get("naturalized") is False:
                 stats["fell_back"] += 1
         d["text"] = nd["text"]
+        d["naturalized"] = nd.get("naturalized")
     return stats
 
 
-# ---------------------------------------------------------------------------
-# offline cache + opt-in loader
-# ---------------------------------------------------------------------------
+def naturalize_selected(world, selected: set[str], llm_client) -> dict:
+    """Naturalize ONLY the passages whose `doc_id` is in `selected` (the passages a
+    task's BM25 searches actually retrieve), leaving every other passage templated.
+
+    Returns {"docs", "naturalized", "retries", "fell_back"} like
+    naturalize_passages, but scoped to the retrieval-relevant subset so we spend
+    LLM calls only where the agent reads prose. Mutates only the selected docs'
+    `text`; entities / attrs / gold are untouched."""
+    stats = {"docs": len(selected), "naturalized": 0, "retries": 0, "fell_back": 0}
+    for d in world.documents:
+        if d.get("doc_id") not in selected:
+            continue
+        if not d.get("text"):
+            continue
+        before = d["text"]
+        nd = naturalize_passage(d, llm_client)
+        if nd["text"] != before:
+            stats["naturalized"] += 1
+            if nd.get("naturalized") is False:
+                stats["fell_back"] += 1
+        d["text"] = nd["text"]
+        d["naturalized"] = nd.get("naturalized")
+    return stats
+
+
 def load_naturalized_loader(cache_path: str | pathlib.Path) -> Callable | None:
     """Load a cache of naturalized passage text produced by 70_naturalize_passages.sh.
 
