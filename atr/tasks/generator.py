@@ -440,12 +440,16 @@ GENERATORS: dict[str, Callable] = {
 # Default mix. Multi-hop work is where score is won; negatives are cheap
 # insurance against the two default failure modes (call a tool for everything;
 # invent an answer rather than abstain).
+# Default mix, aligned to the judged distribution (Multi-hop is where score is
+# won; negatives are cheap insurance). Public benchmark split is 100% 2/3/4-hop;
+# the problem statement still schedules a no-tool scenario (~25% negatives
+# guidance), so no_tool stays ~18% and unanswerable is a small (8%) insurance.
 DEFAULT_MIX: dict[str, float] = {
-    "musique_2hop": 0.22,
-    "musique_3hop": 0.24,
-    "musique_4hop": 0.18,
-    "unanswerable": 0.11,
-    "no_tool": 0.25,
+    "musique_2hop": 0.26,
+    "musique_3hop": 0.28,
+    "musique_4hop": 0.20,
+    "unanswerable": 0.08,
+    "no_tool": 0.18,
 }
 
 # Tool-chain-length curriculum tier: number of `search` calls the reference
