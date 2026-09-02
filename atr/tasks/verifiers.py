@@ -14,7 +14,7 @@ move you know which skill to spend the next data batch on.
 from __future__ import annotations
 
 from ..agent.loop import Trajectory
-from .schema import ScoreCard, Task, match_answer
+from .schema import ScoreCard, Task, answer_f1, match_answer
 
 # The retired send_message tool was the only side-effect tool; with the 8->5
 # tool reduction there are no write tools, so nothing to police here. The
@@ -151,6 +151,15 @@ def score(task: Task, traj: Trajectory, strict_necessity: bool = True,
         # strict mode also refuses answers that were never wrapped in the tag
         correct, reason = False, "untagged_answer_strict"
     sc.final_correct = correct
+    # The official judge scores token-level F1 against the gold string, so that
+    # is what the reward optimises; final_correct stays boolean for diagnostics.
+    # On an unanswerable task there is no gold string to overlap with -- F1
+    # against an abstention marker measures phrasing, not correctness -- so the
+    # abstention decision itself is the score.
+    if task.gold.get("kind") == "none":
+        sc.final_f1 = 1.0 if correct else 0.0
+    else:
+        sc.final_f1 = answer_f1(task.gold, traj.final_answer)
     sc.detail["answer_reason"] = reason
     sc.detail["final_answer"] = (traj.final_answer or "")[:400]
 

@@ -101,6 +101,9 @@ def aggregate(cards: Sequence[ScoreCard]) -> dict:
         return {
             "n": len(cs),
             "success": _rate([c.success for c in cs]),
+            # HEADLINE: token-F1 is the official judge metric. success and
+            # final_correct stay alongside it as internal diagnostics.
+            "final_f1": round(statistics.fmean([c.final_f1 for c in cs]), 4) if cs else None,
             "final_correct": _rate([c.final_correct for c in cs]),
             "format_strict": _rate([c.format_strict for c in cs]),
             "format_loose": _rate([c.format_loose for c in cs]),
@@ -134,7 +137,8 @@ def aggregate(cards: Sequence[ScoreCard]) -> dict:
     }
 
 
-_ROWS = [("success", "TASK SUCCESS"), ("final_correct", "final answer correct"),
+_ROWS = [("final_f1", "ANSWER TOKEN-F1"), ("success", "TASK SUCCESS"),
+         ("final_correct", "final answer correct"),
          ("format_strict", "format strict"), ("format_loose", "format parseable"),
          ("necessity_ok", "tool-necessity decision"), ("selection_ok", "tool selection"),
          ("args_ok", "arguments usable"), ("args_strict", "arguments match oracle"),
@@ -157,15 +161,16 @@ def format_report(rep: dict, title: str = "") -> str:
         L.append(f"  {label:<26} {pct(o.get(key))}")
 
     L.append("")
-    L.append(f"{'BY TASK TYPE':<22}{'n':>4}{'success':>9}{'final':>8}{'select':>8}{'args':>7}{'steps':>7}")
+    L.append(f"{'BY TASK TYPE':<22}{'n':>4}{'F1':>9}{'success':>9}{'final':>8}{'select':>8}{'args':>7}{'steps':>7}")
     for k, b in rep["by_task_type"].items():
-        L.append(f"  {k:<20}{b['n']:>4}{pct(b['success']):>9}{pct(b['final_correct']):>8}"
-                 f"{pct(b['selection_ok']):>8}{pct(b['args_ok']):>7}{b['avg_steps']:>7}")
+        L.append(f"  {k:<20}{b['n']:>4}{pct(b['final_f1']):>9}{pct(b['success']):>9}"
+                 f"{pct(b['final_correct']):>8}{pct(b['selection_ok']):>8}"
+                 f"{pct(b['args_ok']):>7}{b['avg_steps']:>7}")
 
     L.append("")
-    L.append(f"{'BY DIFFICULTY':<22}{'n':>4}{'success':>9}")
+    L.append(f"{'BY DIFFICULTY':<22}{'n':>4}{'F1':>9}{'success':>9}")
     for k, b in rep["by_difficulty"].items():
-        L.append(f"  d{k:<19}{b['n']:>4}{pct(b['success']):>9}")
+        L.append(f"  d{k:<19}{b['n']:>4}{pct(b['final_f1']):>9}{pct(b['success']):>9}")
 
     if rep["failure_modes"]:
         L.append("")

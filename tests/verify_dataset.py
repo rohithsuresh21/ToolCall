@@ -9,7 +9,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "atr"))
 
-from atr.tasks.generator import generate, dev_set, _SHORTCUT_STATS
+from atr.tasks.generator import active_families, generate, dev_set, _SHORTCUT_STATS
 from atr.tools.world import build_world
 from atr.data.naturalize import load_naturalized_loader
 from atr.eval.harness import oracle_backend, evaluate, aggregate
@@ -32,8 +32,17 @@ before = dict(_SHORTCUT_STATS)
 tasks = generate(n, seed_start=0, filter_shortcuts=True, text_loader=loader)
 types = Counter(t.task_type for t in tasks)
 check("train generates 200 tasks", len(tasks) == n)
-check("all 5 families represented", set(types) == {"musique_2hop", "musique_3hop", "musique_4hop",
-                                                   "no_tool", "unanswerable"}, f"{dict(types)}")
+# Family coverage is asserted against the ACTIVE mix, not a hard-coded list of 5.
+# Two directions, both needed: every active family must actually appear (a family
+# that silently stops being minted is a broken generator), and no INACTIVE family
+# may appear (a zero weight that still leaks is the bug this replaced).
+ACTIVE = set(active_families())
+check("active families are the judge's 2/3/4-hop only",
+      ACTIVE == {"musique_2hop", "musique_3hop", "musique_4hop"}, f"{sorted(ACTIVE)}")
+check("every active family is represented", set(types) >= ACTIVE,
+      f"missing={sorted(ACTIVE - set(types))} got={dict(types)}")
+check("no inactive family is minted", not (set(types) - ACTIVE),
+      f"leaked={sorted(set(types) - ACTIVE)} got={dict(types)}")
 after = dict(_SHORTCUT_STATS)
 checked = after.get("checked", 0) - before.get("checked", 0)
 rejected = after.get("rejected", 0) - before.get("rejected", 0)
@@ -48,6 +57,13 @@ good = all(t.oracle_answer and t.gold.get("value") not in (None, "", []) for t i
        all(t.gold.get("kind") == "none" and not t.gold.get("value") for t in unan)
 check("gold invariant holds (ans. have value; unans. kind=none)", good,
       f"answerable={len(answerable)} unanswerable={len(unan)}")
+# The unanswerable half of that check is vacuous while the family is inactive --
+# say so rather than reporting a green tick for an assertion over an empty list.
+check("gold invariant is non-vacuous on the answerable side", len(answerable) > 0,
+      f"answerable={len(answerable)}")
+if "unanswerable" not in ACTIVE:
+    check("unanswerable is inactive, so none are minted", len(unan) == 0, f"unanswerable={len(unan)}")
+    print("NOTE  the unans. kind=none clause above is vacuous (family weight is 0)")
 
 # ---- 3. naturalization actually flows into task worlds (prose differs) ----
 nat_seen = 0
@@ -61,7 +77,11 @@ check("naturalized prose wired into build_world", nat_docs > 0, f"docs naturaliz
 # ---- 4. dev set uses held-out dev shapes with the loader ----
 dev = dev_set(n_per_type=3, text_loader=loader)
 dev_types = Counter(t.task_type for t in dev)
-check("dev set balanced across families", set(dev_types) == set(types), f"{dict(dev_types)}")
+check("dev set covers exactly the active families", set(dev_types) == ACTIVE, f"{dict(dev_types)}")
+# dev_set feeds the GRPO canary, so an off-family task here re-enters checkpoint
+# selection through the back door even with the train mix correct.
+check("dev set is balanced across active families", len(set(dev_types.values())) == 1,
+      f"{dict(dev_types)}")
 
 # ---- 5. end-to-end CLI-equivalent oracle with naturalization active ----
 cfg = LoopConfig(max_steps=10, text_loader=loader)

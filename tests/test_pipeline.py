@@ -32,16 +32,45 @@ check(o["selection_ok"] == 1.0, f"oracle tool selection == 1.0 (got {o['selectio
 check(o["args_strict"] == 1.0, f"oracle strict args == 1.0 (got {o['args_strict']})")
 check(o["necessity_ok"] == 1.0, f"oracle necessity == 1.0 (got {o['necessity_ok']})")
 
-# 3. no-tool tasks must actually be solvable with zero calls, and tool use must be punished
-nt = [t for t in tasks if t.task_type == "no_tool"]
-ntc = [c for c in cards if c.task_type == "no_tool"]
-check(all(c.num_calls == 0 for c in ntc), "oracle makes zero calls on no_tool tasks")
+# 3. family-conditional checks. `all()` over an empty list is True, so any check
+#    scoped to one family passes VACUOUSLY once that family stops being minted.
+#    Gate on active_families() and assert non-emptiness, so dropping a family
+#    turns these off explicitly instead of leaving them green and meaningless.
+from atr.tasks.generator import active_families
+
+ACTIVE = active_families()
+check(set(ACTIVE) == {"musique_2hop", "musique_3hop", "musique_4hop"},
+      f"active families are the judge's 2/3/4-hop only (got {ACTIVE})")
+check(not [t for t in tasks if t.task_type not in ACTIVE],
+      f"dev set mints nothing outside the active families "
+      f"(stray: {sorted({t.task_type for t in tasks if t.task_type not in ACTIVE})})")
 
 from atr.agent.backends import MockBackend
-greedy = MockBackend(plans={t.task_id: [{"name": "search", "arguments": {"query": t.prompt[:40]}}] for t in nt},
-                     answers={t.task_id: t.oracle_answer for t in nt}, degrade_on_error=False)
-gc, _ = evaluate(nt, greedy, cfg=LoopConfig(max_steps=4), progress=False)
-check(all(not c.success for c in gc), "right answer + unnecessary tool call == failure on no_tool")
+
+if "no_tool" in ACTIVE:
+    nt = [t for t in tasks if t.task_type == "no_tool"]
+    ntc = [c for c in cards if c.task_type == "no_tool"]
+    check(len(nt) > 0 and len(ntc) > 0,
+          f"no_tool is an active family so the dev set must contain some (got {len(nt)})")
+    check(all(c.num_calls == 0 for c in ntc), "oracle makes zero calls on no_tool tasks")
+    greedy = MockBackend(
+        plans={t.task_id: [{"name": "search", "arguments": {"query": t.prompt[:40]}}] for t in nt},
+        answers={t.task_id: t.oracle_answer for t in nt}, degrade_on_error=False)
+    gc, _ = evaluate(nt, greedy, cfg=LoopConfig(max_steps=4), progress=False)
+    check(all(not c.success for c in gc),
+          "right answer + unnecessary tool call == failure on no_tool")
+else:
+    # Not skipped silently: assert the family really is gone end to end.
+    check(not [t for t in tasks if t.task_type == "no_tool"],
+          "no_tool is inactive, so the dev set must contain none")
+    check(all(t.needs_tool for t in tasks),
+          "every active task needs the tool (no_tool is the only family that does not)")
+    print("SKIP  no_tool necessity checks -- family weight is 0 (not in the official eval)")
+
+# Every hop task must actually require dependent searches.
+hop = [t for t in tasks if t.task_type.startswith("musique")]
+check(len(hop) == len(tasks) > 0, f"the whole dev set is hop tasks ({len(hop)}/{len(tasks)})")
+check(all(len(t.oracle_plan) >= 1 for t in hop), "every hop task carries a search plan")
 
 # 4. toolset is the single BM25 `search` tool (the judge-collapsed contract:
 #    calculator, web_search, fetch_page, db_query, db_aggregate and the retired
@@ -52,9 +81,8 @@ check(tool_names == ["search"], f"active toolset is exactly the 1 BM25 search to
 check("send_message" not in tool_names and "calculator" not in tool_names
       and "db_query" not in tool_names and "fetch_page" not in tool_names,
       "retired tools are not registered")
-check(all(t.task_type in ("musique_2hop", "musique_3hop", "musique_4hop",
-                          "no_tool", "unanswerable") for t in tasks),
-      f"only MuSiQue-shape + negative families are generated (got {sorted({t.task_type for t in tasks})})")
+check(all(t.task_type in ACTIVE for t in tasks),
+      f"only active families are generated (got {sorted({t.task_type for t in tasks})})")
 o5, _ = evaluate(tasks, oracle_backend(tasks), cfg=LoopConfig(max_steps=10), progress=False)
 agg5 = aggregate(o5)["overall"]
 check(agg5["success"] == 1.0, f"oracle success stays 1.0 on the single-tool toolset (got {agg5['success']})")

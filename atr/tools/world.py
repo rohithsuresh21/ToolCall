@@ -178,6 +178,16 @@ def build_world(seed: int, text_loader=None) -> World:
         pe["attrs"]["employed_by"] = rng.choice(orgs)["name"]
     for i, wk in enumerate(works):
         wk["attrs"]["author"] = rng.choice(people)["name"]
+    # `founder` was declared on every organisation and left None, so the edge it
+    # implies never existed. Without it the relation graph's only sink is the
+    # city<->country pair -- which are mutual inverses here, since every city IS
+    # its country's capital -- so any chain reaching them can only bounce. That
+    # capped the longest acyclic route at 4 hops via a single unique path.
+    # org -> person re-enters the person/org side of the graph and is what makes
+    # longer genuine chains possible. _passage() already renders this attribute
+    # and already lists it in `links`, so nothing downstream needs to change.
+    for o in orgs:
+        o["attrs"]["founder"] = rng.choice(people)["name"]
 
     entities = countries + feats + cities + orgs + people + works
     w.entities = entities

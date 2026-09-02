@@ -9,10 +9,21 @@ shaping should only encode differences you actually want the model to notice.
 
 Deliberate choices worth arguing about:
 
-* `final_correct` gets partial credit even when the task fails. On a 5-hop task
-  a group where every rollout scores 0 gives zero gradient -- the classic GRPO
-  dead group. Partial credit keeps hard tasks learnable instead of silently
-  dropping out of training.
+* The outcome term is token-level F1 (`card.final_f1`), not exact match, because
+  that is what the official judge scores. Optimising normalised-exact-match while
+  being graded on F1 trains for the wrong target, and the gap is not cosmetic:
+  a correct-but-padded answer is full marks under exact match and mediocre under
+  F1. F1 is also continuous, so it gives partial credit even when the task fails.
+  On a 4-hop task a group where every rollout scores 0 gives zero gradient -- the
+  classic GRPO dead group -- and partial credit keeps hard tasks learnable
+  instead of silently dropping out of training.
+* There is no separate verbosity penalty. F1 precision already charges for every
+  token the answer carries beyond the gold span, continuously and in the units
+  the judge uses; a second length term on top double-counts the same signal and
+  lets a hand-tuned character threshold overrule the real metric.
+* `p_no_answer` stays. Pure-F1 objectives are known to collapse into
+  answer-avoidance -- the safest way to protect precision is to say nothing --
+  and that penalty is the mitigation, so it must not be dropped as redundant.
 * Redundant calls are penalised per-call, not as a threshold. A threshold makes
   the penalty invisible until it trips; per-call gives a smooth slope toward
   shorter trajectories. This additive term applies to FAILED episodes; on
@@ -38,7 +49,8 @@ from ..tasks.schema import ScoreCard, Task
 @dataclass
 class RewardConfig:
     w_success: float = 1.0
-    w_final_correct: float = 0.30      # partial credit; keeps hard groups alive
+    w_final_correct: float = 0.30      # scales card.final_f1 (the judge metric);
+                                       # continuous, so hard groups stay alive
     w_selection: float = 0.10
     w_args: float = 0.10
     w_args_strict: float = 0.05
@@ -48,11 +60,13 @@ class RewardConfig:
     p_necessity: float = 0.20          # used tools on a no-tool task, or vice versa
     p_per_extra_call: float = 0.04     # failed episodes only (see scale_by_efficiency)
     p_extra_call_cap: float = 0.24
-    p_no_answer: float = 0.20
-    p_per_1k_chars: float = 0.05       # gentle brevity pressure on the final answer
+    p_no_answer: float = 0.20          # anti-abstention guard; see module docstring
     p_truncated: float = 0.15          # F5: generation was cut off mid-stream
     clip_low: float = -1.0
-    clip_high: float = 1.6
+    # Max positive sum is 1.00+0.30+0.10+0.10+0.05+0.05+0.10 = 1.70. At the old
+    # 1.6 ceiling an otherwise-perfect episode clipped, which silently erased
+    # w_recovery -- exactly the term we most want visible inside a group.
+    clip_high: float = 1.8
 
 
 def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None) -> tuple[float, dict]:
@@ -60,7 +74,7 @@ def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None)
     parts: dict[str, float] = {}
 
     parts["success"] = cfg.w_success * float(card.success)
-    parts["final_correct"] = cfg.w_final_correct * float(card.final_correct)
+    parts["final_correct"] = cfg.w_final_correct * float(card.final_f1)
     parts["selection"] = cfg.w_selection * float(card.selection_ok)
     parts["args"] = cfg.w_args * float(card.args_ok)
     asf = card.detail.get("args_strict_frac")
@@ -84,9 +98,6 @@ def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None)
         parts["extra_calls"] = -min(cfg.p_extra_call_cap, extra * cfg.p_per_extra_call)
     if card.detail.get("answer_reason") == "no_answer":
         parts["no_answer"] = -cfg.p_no_answer
-    n_chars = len(card.detail.get("final_answer") or "")
-    if n_chars > 200:
-        parts["verbosity"] = -cfg.p_per_1k_chars * (n_chars - 200) / 1000.0
     if card.detail.get("truncated"):
         parts["overlong"] = -cfg.p_truncated
 

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import string
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
@@ -37,6 +39,10 @@ class Task:
     forbidden_tools: list[str] = field(default_factory=list)  # must never appear
     oracle_plan: list[dict] = field(default_factory=list)     # reference calls
     oracle_answer: str = ""
+    route: list[str] = field(default_factory=list)            # _REL keys of the chain;
+                                                              # the real diversity axis (see
+                                                              # rejection._shape). Empty for
+                                                              # families with no chain.
     expect_side_effect: dict | None = None                    # e.g. {"to": ..., "must_contain": [...]}
     notes: str = ""
 
@@ -67,6 +73,10 @@ class ScoreCard:
     args_ok: bool = False              # the decisive call carried the right arguments
     recovery_ok: bool | None = None    # None when no error was encountered
     final_correct: bool = False
+    final_f1: float = 0.0              # SQuAD/MuSiQue token-F1 vs the gold string;
+                                       # the OFFICIAL judge metric, and what the RL
+                                       # reward optimises. `final_correct` stays a
+                                       # boolean purely for internal diagnostics.
     side_effect_ok: bool | None = None
     # --- efficiency / diagnostics ---
     num_steps: int = 0
@@ -101,6 +111,79 @@ def norm_text(s: str) -> str:
     s = (s or "").lower().strip()
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+# ---------------------------------------------------------------------------
+# token-level F1 (the official judge metric)
+# ---------------------------------------------------------------------------
+# The judge scores SQuAD/MuSiQue-style token F1 against a short gold string, not
+# exact match. `match_answer` above stays as-is because it drives `success`, the
+# internal boolean diagnostic; F1 is what the reward optimises, so the two must
+# not be conflated. Anything scored here has to reproduce the official
+# normaliser exactly, or every reward we compute is measuring our own dialect.
+_PUNCT = set(string.punctuation)
+_ARTICLES_RE = re.compile(r"\b(a|an|the)\b")
+
+
+def _norm_tokens(s: str) -> list[str]:
+    """The SQuAD normaliser: lower -> drop punctuation -> drop articles -> split.
+
+    Punctuation is DELETED rather than replaced with a space, which is what the
+    official implementation does and is load-bearing here: it makes "3,456,000"
+    and "3456000" the same single token instead of three."""
+    s = (s or "").lower()
+    s = "".join(ch for ch in s if ch not in _PUNCT)
+    s = _ARTICLES_RE.sub(" ", s)
+    return s.split()          # .split() with no arg also collapses whitespace
+
+
+def _f1_tokens(gold_toks: list[str], pred_toks: list[str]) -> float:
+    if not gold_toks or not pred_toks:
+        return 0.0
+    # MULTISET intersection: SQuAD F1 counts token multiplicity, so a prediction
+    # that repeats a gold token does not get credit for it twice. Using set
+    # intersection here silently inflates precision on repetitive answers.
+    n_same = sum((Counter(gold_toks) & Counter(pred_toks)).values())
+    if n_same == 0:
+        return 0.0
+    precision = n_same / len(pred_toks)
+    recall = n_same / len(gold_toks)
+    return 2 * precision * recall / (precision + recall)
+
+
+def _gold_strings(gold: dict | str | None) -> list[str]:
+    """Candidate gold surface forms. `any_of` scores against its best member;
+    `all_of` scores against the concatenation (the answer must carry them all);
+    `none` yields nothing -- abstention is not a string-overlap question and the
+    verifier scores it separately."""
+    if gold is None:
+        return []
+    if isinstance(gold, str):
+        return [gold]
+    kind = gold.get("kind", "text")
+    value = gold.get("value")
+    if kind == "none" or value is None:
+        return []
+    if kind == "any_of":
+        return [str(v) for v in value]
+    if kind == "all_of":
+        return [" ".join(str(v) for v in value)]
+    return [str(value)]
+
+
+def answer_f1(gold: dict | str | None, pred: str | None) -> float:
+    """Token-level F1 of `pred` against `gold`, in [0.0, 1.0].
+
+    `gold` is either a raw gold string or a Task.gold dict. An empty or missing
+    prediction scores 0.0 -- deliberately, even against an empty gold, so that
+    silence can never be farmed for reward."""
+    if not pred or not str(pred).strip():
+        return 0.0
+    pred_toks = _norm_tokens(str(pred))
+    best = 0.0
+    for g in _gold_strings(gold):
+        best = max(best, _f1_tokens(_norm_tokens(g), pred_toks))
+    return best
 
 
 NEGATIVE_MARKERS = [

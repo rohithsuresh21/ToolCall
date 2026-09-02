@@ -13,8 +13,11 @@ Multi-turn GRPO over whole tool-use trajectories, upgraded with:
     in the reward and loss-masked here.
   * Multiplicative tool-efficiency (F7): within a successful set, fewer calls rank
     higher (OTC-PO style). Additive penalties still handle failed episodes.
-  * Best-checkpoint tracking (F6): whenever the held-out canary runs, the best
-    dev-success checkpoint is kept in `<out>/best`.
+  * Best-checkpoint tracking (F6): whenever the held-out canary runs, the highest
+    dev_f1 checkpoint is kept in `<out>/best`. Selection is on dev_f1 alone: the
+    official eval is 2/3/4-hop retrieval scored by token-F1 against a gold string,
+    so F1 is the score and there is no second axis worth trading it against.
+    dev_success and dev_necessity are logged as diagnostics only.
 
 Units (unchanged from the original design):
 
@@ -239,15 +242,21 @@ class GRPOTrainer:
         self.best: dict | None = None          # F6: best canary result so far
 
     # -- 1. sample -------------------------------------------------------
+    # Difficulty here is CHAIN LENGTH -- the only axis left once the eval is
+    # 2/3/4-hop retrieval. Easy leans on 2-hop, hard on 4-hop, and _stage_mix
+    # interpolates through cfg.task_mix in the middle.
+    #
+    # These previously listed compute/db_lookup/db_aggregate/doc_lookup/multi_hop/
+    # multi_hop_discount/distractor/recovery -- eight families deleted in the 8->5
+    # tool reduction, still carrying positive weight. _lerp_mix unions its keys, so
+    # the first 30% of any curriculum run drew from them and generate() raised
+    # KeyError on the first unlucky draw. generate() now rejects such a mix up
+    # front with a message that names the offending families.
     CURRICULUM_EASY = {
-        "no_tool": 0.15, "compute": 0.08, "db_lookup": 0.16, "db_aggregate": 0.14,
-        "doc_lookup": 0.20, "multi_hop": 0.06, "multi_hop_discount": 0.02,
-        "distractor": 0.07, "recovery": 0.04, "unanswerable": 0.08,
+        "musique_2hop": 0.60, "musique_3hop": 0.30, "musique_4hop": 0.10,
     }
     CURRICULUM_HARD = {
-        "no_tool": 0.13, "compute": 0.01, "db_lookup": 0.05, "db_aggregate": 0.04,
-        "doc_lookup": 0.10, "multi_hop": 0.23, "multi_hop_discount": 0.17,
-        "distractor": 0.08, "recovery": 0.13, "unanswerable": 0.06,
+        "musique_2hop": 0.20, "musique_3hop": 0.35, "musique_4hop": 0.45,
     }
 
     @staticmethod
@@ -529,8 +538,33 @@ class GRPOTrainer:
                 "live_groups": len(seen)}
         return pool, info
 
+    @staticmethod
+    def canary_accept(cand: dict, best: dict | None) -> bool:
+        """F6 checkpoint acceptance: highest dev_f1 wins, full stop.
+
+        Token-F1 against the gold string IS the judge's score, and the official
+        eval is 2/3/4-hop retrieval only -- no no_tool family, and the judge never
+        sees tool calls. So there is nothing here to guard against: selecting on
+        anything but dev_f1 would optimise a metric that is not scored.
+
+        This deliberately replaces an earlier dev_success veto. That guard existed
+        to catch a policy buying F1 by calling tools on no_tool tasks (such an
+        episode scores F1 1.0 when the answer is right, so F1 alone cannot see it).
+        With no_tool absent from the official eval, the regression it protected
+        against is not a regression. dev_success stays in the canary log as a
+        DIAGNOSTIC -- useful for reading a run, never an input to selection."""
+        return best is None or cand["dev_f1"] > best["dev_f1"]
+
     def run_dev_canary(self) -> dict:
-        """Held-out success on a small balanced dev set -- the reward-hacking canary."""
+        """Held-out canary on a small balanced dev set.
+
+        dev_f1 is the only number selection reads (see canary_accept). dev_success
+        and dev_necessity come back alongside it as DIAGNOSTICS -- they are worth
+        having in history.jsonl when reading a run, and they are not inputs to any
+        decision. Note the dev set is balanced across all five families while the
+        official eval is 2/3/4-hop only, so dev_f1 here is not the judge's number;
+        it is a consistent internal proxy for ranking checkpoints against each
+        other. The final-selection pass is where the mix should match the judge."""
         from ..eval.harness import aggregate, evaluate, load_eval_config
         ecfg = load_eval_config()
         tasks = dev_set(n_per_type=self.cfg.eval_per_type)
@@ -541,7 +575,8 @@ class GRPOTrainer:
         cards, _ = evaluate(tasks, self.backend, env=self.cfg.env, cfg=loop_cfg,
                             sp=sp, progress=False)
         rep = aggregate(cards)
-        return {"dev_success": rep["overall"]["success"],
+        return {"dev_f1": rep["overall"]["final_f1"],
+                "dev_success": rep["overall"]["success"],
                 "dev_necessity": rep["overall"]["necessity_ok"]}
 
     def train(self):
@@ -562,6 +597,7 @@ class GRPOTrainer:
                 "reward_mean": round(statistics.fmean(rewards), 4),
                 "reward_max": round(max(rewards), 4),
                 "success": round(sum(r["card"].success for r in records) / max(1, len(records)), 4),
+                "final_f1": round(statistics.fmean([r["card"].final_f1 for r in records]), 4) if records else 0.0,
                 "final_correct": round(sum(r["card"].final_correct for r in records) / max(1, len(records)), 4),
                 "format_strict": round(sum(r["card"].format_strict for r in records) / max(1, len(records)), 4),
                 "avg_calls": round(statistics.fmean([r["card"].num_calls for r in records]), 2) if records else 0.0,
@@ -577,16 +613,17 @@ class GRPOTrainer:
             }
             if self.cfg.eval_every and step % self.cfg.eval_every == 0:
                 row.update(self.run_dev_canary())
-                print(f"[grpo] canary step {step}: dev_success={row['dev_success']} "
-                      f"(train success {row['success']})", flush=True)
-                cand = (row["dev_success"], row["reward_mean"], step)
-                if self.best is None or cand[:2] > self.best["score"][:2]:
-                    self.best = {"score": cand}
+                print(f"[grpo] canary step {step}: dev_f1={row['dev_f1']} "
+                      f"dev_success={row['dev_success']} "
+                      f"(train f1 {row['final_f1']})", flush=True)
+                cand = {"step": step, "dev_f1": row["dev_f1"],
+                        "dev_success": row["dev_success"],
+                        "reward_mean": row["reward_mean"]}
+                if self.canary_accept(cand, self.best):
+                    self.best = cand
                     self.model.save_pretrained(out / "best")
                     self.tok.save_pretrained(out / "best")
-                    (out / "best.json").write_text(json.dumps(
-                        {"step": step, "dev_success": row["dev_success"],
-                         "reward_mean": row["reward_mean"]}, indent=2))
+                    (out / "best.json").write_text(json.dumps(cand, indent=2))
                     print(f"[grpo] new BEST checkpoint at step {step}", flush=True)
             self.history.append(row)
             if step % self.cfg.log_every == 0:
@@ -601,8 +638,9 @@ class GRPOTrainer:
         self.model.save_pretrained(out / "final")
         self.tok.save_pretrained(out / "final")
         if self.best is not None:
-            print(f"[grpo] done -> {out / 'final'}  (best canary: "
-                  f"{self.best['score'][0]:.3f} at step {self.best['score'][2]} -> {out / 'best'})")
+            print(f"[grpo] done -> {out / 'final'}  (best canary dev_f1 "
+                  f"{self.best['dev_f1']:.3f} at dev_success {self.best['dev_success']:.3f}, "
+                  f"step {self.best['step']} -> {out / 'best'})")
         else:
             print(f"[grpo] done -> {out / 'final'}")
 

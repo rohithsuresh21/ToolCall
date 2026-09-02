@@ -47,7 +47,17 @@ class FilterConfig:
 
 
 def _shape(task: Task, traj: Trajectory) -> str:
-    sig = f"{task.task_type}|{'>'.join(traj.tool_names)}"
+    """Diversity key: the ROUTE (relation sequence), not the tool-name sequence.
+
+    With a single `search` tool the tool-name sequence is just "search" repeated
+    once per hop, so it carries no information beyond chain length -- which the
+    task_type already fixes. That collapsed every route into 3 buckets (one per
+    family) and made max_per_shape a clumsy duplicate of target_mix while the
+    genuinely distinct routes went uncapped. Keying on task.route restores the
+    intent: cap over-represented CHAINS. Falls back to the tool sequence for
+    routeless families and for records minted before Task.route existed."""
+    axis = ">".join(task.route) if task.route else ">".join(traj.tool_names)
+    sig = f"{task.task_type}|{axis}"
     return hashlib.md5(sig.encode()).hexdigest()[:12]
 
 
@@ -128,6 +138,21 @@ def filter_and_balance(records: Sequence[tuple[Task, Trajectory, ScoreCard]],
         by_type: dict[str, list] = defaultdict(list)
         for r in picked:
             by_type[r[0].task_type].append(r)
+        # A family with a positive target and ZERO supply must not pass silently.
+        # `feasible` below takes the min over families PRESENT in by_type, so a
+        # requested family that produced nothing simply drops out of the min and
+        # the mix renormalises across whatever is left: asking for 40/30/30 and
+        # receiving 57/43/0 looked like success. That is a broken generator or an
+        # impossible route pool, and it should stop the build, not be smoothed over.
+        starved = sorted(k for k, share in cfg.target_mix.items()
+                         if share > 0 and not by_type.get(k))
+        if starved:
+            raise ValueError(
+                f"target_mix requests {starved} but rejection kept zero of each. "
+                f"Kept by type: {dict(Counter(t.task_type for t, _, _ in picked))}. "
+                f"Either the generator cannot mint those families (check "
+                f"gen_musique route viability) or the filters dropped all of them; "
+                f"set their target share to 0.0 to build without them deliberately.")
         # size the whole set by the scarcest type relative to its target share
         feasible = min((len(v) / cfg.target_mix[k]) for k, v in by_type.items()
                        if cfg.target_mix.get(k))

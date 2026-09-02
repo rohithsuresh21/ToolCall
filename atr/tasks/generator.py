@@ -196,6 +196,8 @@ _REL = {
                            "the city where {0} is headquartered", "headquarters"),
     "work_person":        ("work", "author", "person",
                            "the person who created {0}", "author"),
+    "org_founder":        ("organisation", "founder", "person",
+                           "the founder of {0}", "founder"),
 }
 
 # terminal attributes by leaf kind: fact_key -> (attr_question_word, answer_kind)
@@ -222,26 +224,63 @@ _LEAF_ATTR = {
 # functionally identical to another 3-hop route, so holding it out would test
 # nothing). `_ROUTES` remains the union so legacy callers that pass a bare `hops`
 # keep working.
+# Routes are ENUMERATED from the relation graph, not hand-listed: every type-valid
+# sequence whose leaf kind has a terminal attribute, kept when it resolves without
+# revisiting an entity in >=90% of worlds. Before `organisation.founder` was
+# populated, city<->country were mutual inverses and the only sink, so exactly ONE
+# acyclic 4-chain existed (and zero 5-chains). With the founder edge there are 9 at
+# each of lengths 2, 3 and 4.
+#
+# PART 2 (route-shape holdout): exactly one shape per hop count is dev-only, so dev
+# score requires generalising the SHAPE rather than memorising it. The holdout is
+# chosen so that (a) every relation it uses still appears in some train route -- dev
+# tests an unseen COMPOSITION, never unseen vocabulary, which is why the pendant
+# `feature_country` route can never be held out -- and (b) its (start kind, leaf kind)
+# signature is unique. Caveat: a short holdout's relation pair can still appear as a
+# PREFIX inside longer train routes, so the 2-hop holdout tests standalone-task
+# generalisation rather than a wholly unseen composition.
 _ROUTES_TRAIN = {
     2: [
-        ["feature_country", "country_city"],          # leaf city
-        ["person_org", "org_city"],                   # leaf city
-        ["work_person", "person_city"],               # leaf city
+        ["feature_country", "country_city"],   # leaf city
+        ["person_city", "city_country"],   # leaf country
+        ["person_org", "org_city"],   # leaf city
+        ["org_city", "city_country"],   # leaf country
+        ["work_person", "person_city"],   # leaf city
+        ["work_person", "person_org"],   # leaf organisation
+        ["org_founder", "person_city"],   # leaf city
+        ["org_founder", "person_org"],   # leaf organisation
     ],
     3: [
-        ["feature_country", "country_city", "city_country"],   # leaf country
-        ["person_org", "org_city", "city_country"],            # leaf country
-        ["feature_country", "country_city", "city_country"],   # leaf country (var B)
+        ["person_org", "org_city", "city_country"],   # leaf country
+        ["person_org", "org_founder", "person_city"],   # leaf city
+        ["work_person", "person_city", "city_country"],   # leaf country
+        ["work_person", "person_org", "org_city"],   # leaf city
+        ["work_person", "person_org", "org_founder"],   # leaf person
+        ["org_founder", "person_city", "city_country"],   # leaf country
+        ["org_founder", "person_org", "org_city"],   # leaf city
+        ["org_founder", "person_org", "org_founder"],   # leaf person
     ],
     4: [
-        ["feature_country", "country_city", "city_country", "country_city"],   # leaf city
-        ["person_org", "org_city", "city_country", "country_city"],            # leaf city
+        ["person_org", "org_founder", "person_city", "city_country"],   # leaf country
+        ["person_org", "org_founder", "person_org", "org_city"],   # leaf city
+        ["work_person", "person_org", "org_city", "city_country"],   # leaf country
+        ["work_person", "person_org", "org_founder", "person_city"],   # leaf city
+        ["work_person", "person_org", "org_founder", "person_org"],   # leaf organisation
+        ["org_founder", "person_org", "org_city", "city_country"],   # leaf country
+        ["org_founder", "person_org", "org_founder", "person_city"],   # leaf city
+        ["org_founder", "person_org", "org_founder", "person_org"],   # leaf organisation
     ],
 }
 _ROUTES_DEV_ONLY = {
-    2: [["org_city", "city_country"]],                # leaf country (only 2-hop country leaf)
-    3: [["work_person", "person_org", "org_city"]],   # leaf city (only 3-hop city leaf)
-    4: [["work_person", "person_org", "org_city", "city_country"]],            # leaf country
+    2: [
+        ["person_org", "org_founder"],   # leaf person
+    ],
+    3: [
+        ["person_org", "org_founder", "person_org"],   # leaf organisation
+    ],
+    4: [
+        ["person_org", "org_founder", "person_org", "org_founder"],   # leaf person
+    ],
 }
 _ROUTES = {h: _ROUTES_TRAIN[h] + _ROUTES_DEV_ONLY[h] for h in (2, 3, 4)}
 
@@ -267,18 +306,34 @@ def _follow(w: World, ent: dict, step_key: str) -> dict | None:
 
 def _resolve_chain(w: World, rng: random.Random, steps: list[str]) -> list[dict] | None:
     """From a random eligible start entity, follow the route. Returns [E1..leaf]
-    or None if the anchor cannot start the route (try again)."""
+    or None if the anchor cannot start the route, OR if the route REVISITS an
+    entity already in the chain.
+
+    The revisit check is the whole point. Cities in this world are exactly the
+    capitals of countries, so city<->country is a bijection: any route that steps
+    `country_city` then `city_country` (or the reverse) lands back where it
+    started. A route like feature_country > country_city > city_country walks
+    F -> C -> capital(C) -> C and is a 2-hop question wearing a 3-hop label. It
+    scored as 3-hop in every by_difficulty breakdown, and its oracle plan repeated
+    a query verbatim, which is why rejection.py was discarding ~60% of the 3/4-hop
+    trajectories as `repeated_call`.
+
+    Returning None here makes the degenerate route unusable rather than silently
+    mislabelled: gen_musique moves on to the next route, and _hop_or_shorter
+    reports honestly by degrading to a shorter chain it can actually build."""
     from_k = _REL[steps[0]][0]
     cands = [e for e in w.entities if e["kind"] == from_k]
     rng.shuffle(cands)
     for start in cands:
         chain = [start]
+        seen = {start["id"]}
         ok = True
         for step_key in steps:
             nxt = _follow(w, chain[-1], step_key)
-            if nxt is None:
+            if nxt is None or nxt["id"] in seen:
                 ok = False
                 break
+            seen.add(nxt["id"])
             chain.append(nxt)
         if ok:
             return chain
@@ -383,20 +438,38 @@ def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: s
             forbidden_tools=[],
             oracle_plan=plan,
             oracle_answer=answer,
+            route=list(steps),
             notes=f"{hops}-hop retrieval chain; {len(plan)} dependent searches")
     return None
 
 
+def _hop_or_shorter(rng, w, seed, hops: int, **kw) -> Task:
+    """Mint the requested chain length, degrading to a SHORTER CHAIN first.
+
+    gen_musique returns None when this world has no route of that length, or when
+    every candidate was rejected by the shortcut filter. The old fallback dropped
+    straight to gen_no_tool, which minted ~1% no_tool tasks even under a hop-only
+    mix -- a family the official eval does not contain, leaking in through a path
+    no weight controls. Degrading 4 -> 3 -> 2 keeps the task inside the scored
+    families and only costs a hop. gen_no_tool remains the last resort for a world
+    that supports no chain at all; `generate()` reports if that ever fires."""
+    for h in range(hops, 1, -1):
+        task = gen_musique(w, rng, seed, h, f"musique_{h}hop", **kw)
+        if task is not None:
+            return task
+    return gen_no_tool(rng, w, seed)
+
+
 def gen_2hop(rng, w, seed, **kw):
-    return gen_musique(w, rng, seed, 2, "musique_2hop", **kw) or gen_no_tool(rng, w, seed)
+    return _hop_or_shorter(rng, w, seed, 2, **kw)
 
 
 def gen_3hop(rng, w, seed, **kw):
-    return gen_musique(w, rng, seed, 3, "musique_3hop", **kw) or gen_no_tool(rng, w, seed)
+    return _hop_or_shorter(rng, w, seed, 3, **kw)
 
 
 def gen_4hop(rng, w, seed, **kw):
-    return gen_musique(w, rng, seed, 4, "musique_4hop", **kw) or gen_no_tool(rng, w, seed)
+    return _hop_or_shorter(rng, w, seed, 4, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -440,12 +513,22 @@ GENERATORS: dict[str, Callable] = {
 # Default mix. Multi-hop work is where score is won; negatives are cheap
 # insurance against the two default failure modes (call a tool for everything;
 # invent an answer rather than abstain).
+# The official eval is 2/3/4-hop retrieval ONLY -- the organizers confirmed there
+# are no no_tool and no unanswerable items, and the judge scores token-F1 against
+# a gold string, so it never sees tool calls. Training or selecting on those two
+# families optimises something that is not scored.
+#
+# Their weights are 0.0 rather than deleted, and their generators stay registered
+# in GENERATORS: the code is the record of what the harness can mint, and if the
+# task spec changes again these come back by editing one number. A zero weight is
+# never drawn by generate()'s random.choices, and dev_set() skips zero-weight
+# families too, so nothing is minted from them anywhere.
 DEFAULT_MIX: dict[str, float] = {
-    "musique_2hop": 0.22,
-    "musique_3hop": 0.24,
-    "musique_4hop": 0.18,
-    "unanswerable": 0.11,
-    "no_tool": 0.25,
+    "musique_2hop": 0.40,
+    "musique_3hop": 0.30,
+    "musique_4hop": 0.30,
+    "unanswerable": 0.0,          # not in the official eval
+    "no_tool": 0.0,               # not in the official eval
 }
 
 # Tool-chain-length curriculum tier: number of `search` calls the reference
@@ -457,6 +540,13 @@ TASK_TIERS: dict[str, int] = {
     "unanswerable": 1,
     "no_tool": 0,
 }
+
+
+# How many worlds to try before accepting an out-of-mix task. Worlds that support
+# no chain are ~0.2% of seeds, so two retries make the residue negligible without
+# meaningfully widening the seed range a batch touches.
+_MINT_ATTEMPTS = 3
+_MINT_STATS: dict[str, int] = {"fallbacks": 0, "unminted": 0}
 
 
 def generate(n: int, seed_start: int = 0, mix: dict[str, float] | None = None,
@@ -476,39 +566,81 @@ def generate(n: int, seed_start: int = 0, mix: dict[str, float] | None = None,
     prose (facts/gold unchanged) instead of the fixed templates.
     """
     mix = mix or DEFAULT_MIX
+    # Fail loudly on a mix that names families this harness cannot mint. Weights
+    # arrive from callers that build them (grpo._stage_mix lerps two dicts and
+    # unions their keys), so a stale family name otherwise surfaces as a KeyError
+    # from a random draw partway into a GPU run -- or not at all, if the draw
+    # never happens to select it.
+    unknown = sorted(k for k, v in mix.items() if v > 0 and k not in GENERATORS)
+    if unknown:
+        raise ValueError(
+            f"mix names families with no generator: {unknown}. "
+            f"Known families: {sorted(GENERATORS)}. "
+            f"A zero weight is fine (it is never drawn); a positive one is a bug.")
+    if not any(v > 0 for v in mix.values()):
+        raise ValueError("mix has no family with a positive weight -- nothing to mint")
     kinds = list(mix)
     weights = [mix[k] for k in kinds]
+    active = set(active_families(mix))
     picker = random.Random(rng_seed)
     tasks: list[Task] = []
+    fallbacks = 0
     for i in range(n):
-        seed = seed_start + i
         kind = picker.choices(kinds, weights=weights, k=1)[0]
-        w = build_world(seed, text_loader=text_loader)
-        rng = random.Random(seed * 7919 + 13)
-        task = GENERATORS[kind](rng, w, seed, filter_shortcuts=filter_shortcuts)
+        # A world can support no chain at all (no route resolves, or the shortcut
+        # filter rejects every candidate), and the generator then degrades out of
+        # the hop families entirely. Re-mint from a different world rather than
+        # keep a task from a family the official eval does not contain. Offsets
+        # are multiples of n, so every attempt lands on a seed no other index in
+        # this batch uses and the whole batch stays inside [seed_start, +n*ATTEMPTS).
+        for attempt in range(_MINT_ATTEMPTS):
+            seed = seed_start + i + attempt * n
+            w = build_world(seed, text_loader=text_loader)
+            rng = random.Random(seed * 7919 + 13)
+            task = GENERATORS[kind](rng, w, seed, filter_shortcuts=filter_shortcuts)
+            if task.task_type in active:
+                break
+            fallbacks += 1
         task.tier = max(TASK_TIERS[kind], _chain_len(task))
         tasks.append(task)
+    _MINT_STATS["fallbacks"] = fallbacks
+    _MINT_STATS["unminted"] = sum(1 for t in tasks if t.task_type not in active)
     return tasks
 
 
-def dev_set(n_per_type: int = 6, seed_start: int = 900_000, text_loader=None) -> list[Task]:
-    """A balanced, reproducible development set: equal weight per family. Uses the
-    DEV route pool so each multi-hop family is guaranteed to include its held-out
-    dev-only shape (the ones excluded from train).
+def active_families(mix: dict[str, float] | None = None) -> list[str]:
+    """Families with a non-zero weight -- the ones the harness actually mints.
+
+    One source of truth for train and dev. dev_set() used to iterate GENERATORS
+    directly, so zeroing a weight silenced it in training while the dev set (and
+    therefore the GRPO canary) kept drawing it -- selecting checkpoints partly on
+    families the judge does not score."""
+    mix = DEFAULT_MIX if mix is None else mix
+    return [k for k in GENERATORS if mix.get(k, 0.0) > 0]
+
+
+def dev_set(n_per_type: int = 6, seed_start: int = 900_000, text_loader=None,
+            mix: dict[str, float] | None = None) -> list[Task]:
+    """A balanced, reproducible development set: equal weight per ACTIVE family
+    (see active_families). Uses the DEV route pool so each multi-hop family is
+    guaranteed to include its held-out dev-only shape (the ones excluded from
+    train).
 
     `text_loader` is the Part A opt-in hook to build dev worlds with natural,
     varied passage prose (see generate())."""
     tasks: list[Task] = []
     seed = seed_start
-    for kind, fn in GENERATORS.items():
+    for kind in active_families(mix):
+        fn = GENERATORS[kind]
         made = 0
         while made < n_per_type:
             w = build_world(seed, text_loader=text_loader)
             t = fn(random.Random(seed * 7919 + 13), w, seed, route_pool="dev")
             if t.task_type != kind:
-                # fallback substitution (gen_*_hop can degrade to no_tool); keep going
-                tasks.append(t)
-                made += 1
+                # This world supports no chain of that length. SKIP the seed
+                # rather than keeping the degraded task: the dev set is what the
+                # GRPO canary scores, so an off-family task here would put a
+                # family the judge never runs back into checkpoint selection.
                 seed += 1
                 continue
             t.tier = max(TASK_TIERS.get(kind, 0), _chain_len(t))

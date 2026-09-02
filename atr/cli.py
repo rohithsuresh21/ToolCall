@@ -103,6 +103,7 @@ def cmd_build(args):
     kept, summary = filter_and_balance(recs, FilterConfig(
         require_strict_format=args.strict_format,
         max_per_task=args.max_per_task,
+        max_per_shape=args.max_per_shape,
         max_call_bloat=args.max_call_bloat,
         target_mix=DEFAULT_MIX if args.rebalance else None))
     print(json.dumps(summary, indent=2))
@@ -212,6 +213,9 @@ def main(argv=None):
     b.add_argument("--out", default="artifacts/sft.jsonl")
     b.add_argument("--strict-format", action="store_true")
     b.add_argument("--max-per-task", type=int, default=1)
+    b.add_argument("--max-per-shape", type=int, default=400,
+                   help="cap kept trajectories per (family, route) shape; "
+                        "raise it to scale the set past 3*400")
     b.add_argument("--max-call-bloat", type=float, default=2.0)
     b.add_argument("--rebalance", action="store_true")
     b.add_argument("--drop-thinking", action="store_true")
