@@ -1,5 +1,10 @@
 # Part 1 + Part 2 tests: shortcut (disconnection) filter and train/dev route holdout.
 # Style mirrors test_fix2.py: plain PASS/FAIL assertions, no pytest dependency.
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
 from atr.tasks.generator import (
     generate, dev_set, gen_musique,
     _ROUTES_TRAIN, _ROUTES_DEV_ONLY, _REL,

@@ -113,6 +113,19 @@ class GRPOConfig:
     # --- curriculum ---
     task_mix: dict = field(default_factory=lambda: dict(DEFAULT_MIX))
     curriculum: bool = True               # stage difficulty easy -> default -> hard
+    # curriculum_feedback closes the loop from the (already-computed) dead-group
+    # diagnostic back into sampling: when the rolling frac_dead_groups exceeds
+    # dead_group_threshold, _stage_mix pulls the curriculum position f back
+    # toward CURRICULUM_EASY instead of ramping purely on step count.
+    #
+    # Default ON: it automates exactly the manual remedy the design notes already
+    # prescribe ("above ~0.5 the mix is too hard, re-weight the curriculum toward
+    # difficulty 2-3"), and the pullback is inert below the threshold, so a healthy
+    # run is bit-identical to the step-only ramp. Set false to reproduce a run made
+    # before this knob existed, or to compare against a step-only baseline.
+    curriculum_feedback: bool = True
+    dead_group_window: int = 5            # rolling window of frac_dead_groups fed back
+    dead_group_threshold: float = 0.5     # same number the README advises a human to watch
     seed_start: int = 1_000_000
     seed_span: int = 400_000
     seed: int = 0
@@ -139,18 +152,34 @@ class _PolicyBackend(Backend):
         self.tok.padding_side = "left"
         enc = self.tok(texts, return_tensors="pt", padding=True,
                        add_special_tokens=False).to(self.model.device)
+        # Rollouts must run in clean inference mode. During training the policy
+        # is in train() with gradient checkpointing ON, both of which corrupt
+        # sampling: train dropout degrades output and grad-checkpointing forces
+        # use_cache=False, which together produce gibberish instead of tool
+        # calls. Dropout is only ever active because we are mid-training; here
+        # we temporarily switch to eval + no-checkpoint for a correct, cached
+        # forward, then restore the exact previous state.
         was_training = self.model.training
         cache = getattr(self.model.config, "use_cache", None)
-        self.model.config.use_cache = True
-        with torch.no_grad():
-            gen = self.model.generate(
-                **enc, max_new_tokens=sp.max_tokens, do_sample=sp.temperature > 0,
-                temperature=max(sp.temperature, 1e-5), top_p=sp.top_p,
-                top_k=getattr(sp, "top_k", None),
-                pad_token_id=self.tok.pad_token_id)
-        self.model.config.use_cache = cache
+        gc_enabled = getattr(self.model, "_is_gradient_checkpointing", None)
         if was_training:
-            self.model.train()
+            self.model.eval()
+        if gc_enabled:
+            self.model.gradient_checkpointing_disable()
+        self.model.config.use_cache = True
+        try:
+            with torch.no_grad():
+                gen = self.model.generate(
+                    **enc, max_new_tokens=sp.max_tokens, do_sample=sp.temperature > 0,
+                    temperature=max(sp.temperature, 1e-5), top_p=sp.top_p,
+                    top_k=getattr(sp, "top_k", None),
+                    pad_token_id=self.tok.pad_token_id)
+        finally:
+            self.model.config.use_cache = cache
+            if gc_enabled:
+                self.model.gradient_checkpointing_enable()
+            if was_training:
+                self.model.train()
         from .grpo import _cut  # local import keeps this file self-contained
         outs = []
         for i in range(len(batch)):
@@ -240,6 +269,9 @@ class GRPOTrainer:
         self.reward_cfg = RewardConfig()
         self.history: list[dict] = []
         self.best: dict | None = None          # F6: best canary result so far
+        # rolling frac_dead_groups fed into _stage_mix by curriculum_feedback;
+        # maintained in train(), capped at dead_group_window entries
+        self.dead_frac_window: list[float] = []
 
     # -- 1. sample -------------------------------------------------------
     # Difficulty here is CHAIN LENGTH -- the only axis left once the eval is
@@ -252,6 +284,9 @@ class GRPOTrainer:
     # the first 30% of any curriculum run drew from them and generate() raised
     # KeyError on the first unlucky draw. generate() now rejects such a mix up
     # front with a message that names the offending families.
+    # Both tiers sum to exactly 1.0. _lerp_mix renormalises, so a tier summing to
+    # less than 1 still lerps to the right SHAPE, but the endpoint at f=0 is then
+    # not the literal tier -- which is what the curriculum-feedback test asserts.
     CURRICULUM_EASY = {
         "musique_2hop": 0.60, "musique_3hop": 0.30, "musique_4hop": 0.10,
     }
@@ -266,9 +301,37 @@ class GRPOTrainer:
         s = sum(raw.values()) or 1.0
         return {k: v / s for k, v in raw.items()}
 
+    def _rolling_dead_mean(self) -> float:
+        """Mean frac_dead_groups over the feedback window (empty window -> 0)."""
+        w = self.dead_frac_window or [0.0]
+        return sum(w) / len(w)
+
+    def _curriculum_fraction(self, step: int) -> float:
+        """Effective curriculum position f fed into _stage_mix.
+
+        With curriculum_feedback ON and the rolling mean of frac_dead_groups above
+        dead_group_threshold, f is pulled back toward CURRICULUM_EASY (f -> 0)
+        proportionally to how far over the threshold the recent dead-group fraction
+        sits -- so the sampler retreats toward easier tasks instead of ramping into
+        CURRICULUM_HARD while the policy is producing mostly dead groups. With the
+        knob OFF (default), or with the rolling mean below the threshold, this is
+        exactly the step-only ramp (step / steps), so existing behaviour is
+        provably unchanged.
+        """
+        f = step / max(1, self.cfg.steps)
+        if not self.cfg.curriculum_feedback:
+            return f
+        mean = self._rolling_dead_mean()
+        if mean <= self.cfg.dead_group_threshold:
+            return f
+        overshoot = (mean - self.cfg.dead_group_threshold) / max(
+            1e-9, self.cfg.dead_group_threshold)
+        pullback = min(1.0, overshoot)
+        return f * (1.0 - pullback)
+
     def _stage_mix(self, step: int) -> dict:
         """easy (f<0.3) -> default mix (0.3-0.65) -> hard (f>0.7), linear in between."""
-        f = step / max(1, self.cfg.steps)
+        f = self._curriculum_fraction(step)
         if f < 0.30:
             return self._lerp_mix(self.CURRICULUM_EASY, self.cfg.task_mix, f / 0.30)
         if f < 0.70:
@@ -591,6 +654,16 @@ class GRPOTrainer:
             items = self.encode(records)
             ostats = self.optimise(items)
 
+            # feed the live dead-group diagnostic into the rolling window used by
+            # curriculum_feedback; keep at most dead_group_window entries
+            self.dead_frac_window.append(ginfo.get("frac_dead_groups", 0.0))
+            if len(self.dead_frac_window) > max(1, self.cfg.dead_group_window):
+                self.dead_frac_window.pop(0)
+
+            feedback = self.cfg.curriculum_feedback
+            dg_mean = self._rolling_dead_mean()
+            pulled_back = (feedback and dg_mean > self.cfg.dead_group_threshold)
+
             rewards = [r["reward"] for r in records] or [0.0]
             row = {
                 "step": step,
@@ -610,6 +683,8 @@ class GRPOTrainer:
                 **dinfo,
                 **{k: v for k, v in ginfo.items() if k != "frac_void_episodes"},
                 "frac_void_episodes": ginfo.get("frac_void_episodes", 0.0),
+                "dead_group_rolling_mean": round(dg_mean, 4),
+                "curriculum_pulled_back": bool(pulled_back),
             }
             if self.cfg.eval_every and step % self.cfg.eval_every == 0:
                 row.update(self.run_dev_canary())
