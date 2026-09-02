@@ -1,5 +1,10 @@
 # Part A tests: LLM passage naturalization (facts untouched, scoring isolated).
 # Uses a mock LLM client -- NO API key, fully offline.
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
 from atr.data.naturalize import (
     naturalize_passage, naturalize_passages, load_naturalized_loader,
     _facts_present, _surfaced_facts, _format_for_check,

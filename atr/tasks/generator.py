@@ -239,9 +239,11 @@ _ROUTES_TRAIN = {
     ],
 }
 _ROUTES_DEV_ONLY = {
-    2: [["org_city", "city_country"]],                # leaf country (only 2-hop country leaf)
-    3: [["work_person", "person_org", "org_city"]],   # leaf city (only 3-hop city leaf)
-    4: [["work_person", "person_org", "org_city", "city_country"]],            # leaf country
+    2: [["org_city", "city_country"], ["person_city", "city_country"]],
+    3: [["work_person", "person_org", "org_city"],
+        ["work_person", "person_city", "city_country"]],
+    4: [["work_person", "person_org", "org_city", "city_country"],
+        ["work_person", "person_city", "city_country", "country_city"]],
 }
 _ROUTES = {h: _ROUTES_TRAIN[h] + _ROUTES_DEV_ONLY[h] for h in (2, 3, 4)}
 
@@ -501,22 +503,34 @@ def dev_set(n_per_type: int = 6, seed_start: int = 900_000, text_loader=None) ->
     dev-only shape (the ones excluded from train).
 
     `text_loader` is the Part A opt-in hook to build dev worlds with natural,
-    varied passage prose (see generate())."""
+    varied passage prose (see generate()).
+
+    Only a genuine task of the requested family counts toward that family's quota:
+    the gen_*_hop fallback can degrade to `no_tool` when a dev route fails to
+    resolve or is rejected as a shortcut -- such a substitute does NOT fulfil the
+    multi-hop slot, so we retry with a new seed. Attempts are capped so an
+    exhausted dev pool logs a warning instead of looping forever or silently
+    under-representing a family."""
     tasks: list[Task] = []
     seed = seed_start
     for kind, fn in GENERATORS.items():
         made = 0
-        while made < n_per_type:
+        attempts = 0
+        max_attempts = n_per_type * 40
+        while made < n_per_type and attempts < max_attempts:
+            attempts += 1
             w = build_world(seed, text_loader=text_loader)
             t = fn(random.Random(seed * 7919 + 13), w, seed, route_pool="dev")
+            seed += 1
             if t.task_type != kind:
-                # fallback substitution (gen_*_hop can degrade to no_tool); keep going
-                tasks.append(t)
-                made += 1
-                seed += 1
+                # fallback substitution (gen_*_hop degraded to no_tool); not a
+                # genuine family member -- retry, do not count it.
                 continue
             t.tier = max(TASK_TIERS.get(kind, 0), _chain_len(t))
             tasks.append(t)
             made += 1
-            seed += 1
+        if made < n_per_type:
+            import warnings
+            warnings.warn(f"dev_set: only {made}/{n_per_type} of family {kind} after "
+                          f"{max_attempts} attempts; family under-represented", RuntimeWarning)
     return tasks

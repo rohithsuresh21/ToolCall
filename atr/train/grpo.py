@@ -267,8 +267,8 @@ class GRPOTrainer:
 
     # -- 1. sample -------------------------------------------------------
     CURRICULUM_EASY = {
-        "no_tool": 0.15, "musique_2hop": 0.16, "musique_3hop": 0.14,
-        "musique_4hop": 0.12, "unanswerable": 0.08,
+        "no_tool": 0.25, "musique_2hop": 0.28, "musique_3hop": 0.22,
+        "musique_4hop": 0.15, "unanswerable": 0.10,
     }
     CURRICULUM_HARD = {
         "no_tool": 0.13, "musique_2hop": 0.20, "musique_3hop": 0.28,
