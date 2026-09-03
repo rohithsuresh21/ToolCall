@@ -71,10 +71,12 @@ class RewardConfig:
     w_progress: float = 0.20
     w_reformulate: float = 0.10
     clip_low: float = -1.0
-    # Max positive sum is 1.00+0.30+0.10+0.10+0.05+0.05+0.10 = 1.70. At the old
-    # 1.6 ceiling an otherwise-perfect episode clipped, which silently erased
-    # w_recovery -- exactly the term we most want visible inside a group.
-    clip_high: float = 1.8
+    # Max positive sum is 1.00+0.30+0.10+0.10+0.05+0.05+0.10 = 1.70 from the
+    # outcome/selection/args/format/recovery terms, plus 0.45 from the per-hop
+    # chain shaping (w_anchor+w_progress+w_reformulate) = 2.15. The ceiling must
+    # clear this so a perfect episode never clips, which would silently erase the
+    # small shaping terms inside a group (w_recovery AND the hop terms).
+    clip_high: float = 2.3
 
 
 def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None) -> tuple[float, dict]:
