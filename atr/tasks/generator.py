@@ -399,11 +399,21 @@ def _phrase_chain(steps: list[str], chain: list[dict]) -> str:
 
 
 def _build_route_oracle(steps: list[str], chain: list[dict]) -> list[dict]:
-    """One search per hop. Query = next entity name + this hop's relation kw."""
+    """One search per hop. Query = the CURRENT (source) entity name + this hop's
+    relation kw, i.e. search what you already know to DISCOVER the next entity.
+
+    chain[k-1] ->(steps[k-1])-> chain[k]. Before hop k you only know chain[k-1]
+    (the prompt names chain[0]; each search reveals the next). So the query that
+    RETRIEVES chain[k]'s passage is chain[k-1]'s name + the relation keyword.
+    Searching chain[k]'s name instead (the destination) would require knowing it
+    before the search -- an off-by-one that taught SFT to emit "psychic" first
+    searches (a confident proper noun absent from the prompt, e.g. "Aether
+    Dynamics"), since it imitated these broken plans verbatim.
+    """
     plan = []
     for k in range(1, len(chain)):
         _, _, _, _, kw = _REL[steps[k - 1]]
-        plan.append({"name": "search", "arguments": {"query": f"{chain[k]['name']} {kw}"}})
+        plan.append({"name": "search", "arguments": {"query": f"{chain[k - 1]['name']} {kw}"}})
     return plan
 
 
