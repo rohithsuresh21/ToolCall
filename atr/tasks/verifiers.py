@@ -13,8 +13,10 @@ move you know which skill to spend the next data batch on.
 """
 from __future__ import annotations
 
+import re
+
 from ..agent.loop import Trajectory
-from .schema import ScoreCard, Task, answer_f1, match_answer
+from .schema import ScoreCard, Task, answer_f1, match_answer, norm_text
 
 # The retired send_message tool was the only side-effect tool; with the 8->5
 # tool reduction there are no write tools, so nothing to police here. The
@@ -60,6 +62,97 @@ def _key_args_match(oracle_args: dict, got_args: dict) -> bool:
         if _norm_val(got_args[k]) != _norm_val(v):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# per-hop diagnostics (dense shaping signal for the multi-hop collapse)
+# ---------------------------------------------------------------------------
+# Every oracle search query is "<Entity Name...> <relation keyword>", e.g.
+# "Luca Alvarez author". The relation keyword is a lowercase single word; the
+# entity is the leading capitalized name. We keep the anchor check anchored to
+# the REAL head entity of the oracle chain -- not just "some phrase from the
+# prompt" -- so echoing the whole question is never rewarded.
+_ORACLE_QUERY_ENT = re.compile(r"^((?:[A-Z][A-Za-z0-9']*\s?)+)")
+
+
+def _oracle_entity(query: str) -> str:
+    m = _ORACLE_QUERY_ENT.match(query or "")
+    return m.group(1).strip().lower() if m else ""
+
+
+def _search_queries(task: Task, traj: Trajectory) -> list[str]:
+    """Model's search queries in call order (skips non-search calls)."""
+    out = []
+    for c in traj.call_log:
+        if c["name"] != "search":
+            continue
+        q = (c.get("args") or {}).get("query")
+        if q:
+            out.append(str(q))
+    return out
+
+
+def _hop_diagnostics(task: Task, traj: Trajectory):
+    """Populate sc.detail with anchor/progress/reformulate signals.
+
+    Anti-hacking rules (from review): the reformulate bonus must be PAIRED with
+    genuine forward progress -- a query only counts as "reformulating" when it
+    advances to the NEXT entity in the oracle chain, never merely because it uses
+    a different string than the previous query. The anchor check is against the
+    oracle's actual head entity, not loose prompt-text overlap.
+    """
+    plan = [s for s in task.oracle_plan
+            if s.get("name") == "search" and (s.get("arguments") or {}).get("query")]
+    if not plan:
+        return {}
+    oracle_ents = [_oracle_entity(s["arguments"]["query"]) for s in plan]
+    oracle_ents = [e for e in oracle_ents if e]
+    if not oracle_ents:
+        return {}
+
+    head = oracle_ents[0]                      # the real anchor entity
+    queries = _search_queries(task, traj)
+
+    # ---- anchor: does the FIRST search start from the actual head entity? ----
+    anchor_ok = False
+    if queries:
+        first = norm_text(queries[0]).split()
+        anchor_ok = head in (" ".join(first)) or any(head in norm_text(q) for q in queries[:1])
+
+    # ---- progress: how far along the oracle chain (in order) do queries reach? ----
+    # Greedy ordered advance: each model query may satisfy the NEXT unmet oracle
+    # entity. Counts coverage, penalises out-of-order / repeated sprays.
+    qnorm = [norm_text(q) for q in queries]
+    covered = 0
+    for e in oracle_ents:
+        if covered < len(qnorm) and e in qnorm[covered]:
+            covered += 1
+            qnorm = qnorm[covered:]
+        else:
+            # allow skipping: still try to find this entity anywhere ahead
+            ahead = next((i for i, q in enumerate(qnorm) if e in q), None)
+            if ahead is None:
+                break
+            covered += 1
+            qnorm = qnorm[ahead + 1:]
+
+    # ---- reformulate: queries that ADVANCED to a new chain entity ----
+    # Only queries that land on the next unmet oracle entity count as genuine
+    # reformulation; firing distinct-but-random strings scores nothing.
+    qnorm2 = [norm_text(q) for q in queries]
+    pointer = 0
+    advanced = 0
+    for q in qnorm2:
+        if pointer < len(oracle_ents) and oracle_ents[pointer] in q:
+            pointer += 1
+            advanced += 1
+
+    return {
+        "anchor_ok": bool(anchor_ok),
+        "progress_frac": round(covered / len(oracle_ents), 3) if oracle_ents else 0.0,
+        "reformulate_frac": round((advanced / max(1, pointer)) if pointer else 0.0, 3),
+        "reformulate_ok": bool(advanced > 0),
+    }
 
 
 def score(task: Task, traj: Trajectory, strict_necessity: bool = True,
@@ -120,6 +213,10 @@ def score(task: Task, traj: Trajectory, strict_necessity: bool = True,
     sc.args_ok = loose_args
     sc.detail["args_strict_frac"] = round(strict_hits / strict_total, 3) if strict_total else None
     sc.detail["arg_coercions"] = sum(1 for c in traj.call_log if c.get("coerced"))
+
+    # ---- per-hop chain diagnostics (anchor / progress / reformulate) --------
+    if task.task_type in ("musique_2hop", "musique_3hop", "musique_4hop"):
+        sc.detail.update(_hop_diagnostics(task, traj))
 
     # ---- recovery -------------------------------------------------------
     if errors:

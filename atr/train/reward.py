@@ -62,6 +62,14 @@ class RewardConfig:
     p_extra_call_cap: float = 0.24
     p_no_answer: float = 0.20          # anti-abstention guard; see module docstring
     p_truncated: float = 0.15          # F5: generation was cut off mid-stream
+    # Per-hop chain shaping for the multi-hop collapse (GRPO only). These dense
+    # terms exist so a trajectory that does hops 1-2 correctly but trips on hop 3
+    # still earns credit, instead of the all-or-nothing final-answer signal.
+    # Anti-hack (review): `w_reformulate` only pays when the query ADVANCED to the
+    # next oracle-chain entity (progress > 0), never for spraying different strings.
+    w_anchor: float = 0.15
+    w_progress: float = 0.20
+    w_reformulate: float = 0.10
     clip_low: float = -1.0
     # Max positive sum is 1.00+0.30+0.10+0.10+0.05+0.05+0.10 = 1.70. At the old
     # 1.6 ceiling an otherwise-perfect episode clipped, which silently erased
@@ -81,6 +89,17 @@ def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None)
     parts["args_strict"] = cfg.w_args_strict * float(asf) if asf is not None else 0.0
     parts["format"] = cfg.w_format_strict * float(card.format_strict)
     parts["recovery"] = cfg.w_recovery * (1.0 if card.recovery_ok is True else 0.0)
+
+    # Per-hop chain shaping. `reformulate` is gated on genuine forward progress so
+    # a policy that fires three random entity names cannot collect it for "moving
+    # to a different string" -- it must actually advance along the oracle chain.
+    anchor_ok = card.detail.get("anchor_ok")
+    if anchor_ok is not None:
+        parts["anchor"] = cfg.w_anchor * float(anchor_ok)
+        progress = float(card.detail.get("progress_frac") or 0.0)
+        parts["progress"] = cfg.w_progress * progress
+        if progress > 0 and card.detail.get("reformulate_ok"):
+            parts["reformulate"] = cfg.w_reformulate * float(card.detail.get("reformulate_frac") or 0.0)
 
     if card.side_effect_ok is False and not task.expect_side_effect:
         parts["side_effect"] = -cfg.p_side_effect

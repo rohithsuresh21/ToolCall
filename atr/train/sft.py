@@ -55,10 +55,15 @@ class SFTConfig:
     eval_frac: float = 0.02
     save_steps: int = 200
     log_steps: int = 10
-    # Weight later assistant turns more heavily. Multi-step failures concentrate
-    # in the turns *after* the first tool result, but those turns are a minority
-    # of tokens, so an unweighted loss under-trains exactly the skill you need.
-    late_turn_weight: float = 1.0
+    # Per-step loss weighting to fix multi-hop collapse. Every <tool_call> turn is
+    # a "step" that builds the chain (the anchor search, the next hop, ...). These
+    # intermediate tool calls used to be washed out: the old ramp weighted the
+    # LAST assistant turn most, which is just the trivial <final_answer>. Instead:
+    #   * step_weight (>1) boosts each tool-call step, with hop 1 (the crucial
+    #     anchor that must start from the real entity) boosted most.
+    #   * answer_weight (<1) de-emphasises the final-answer turn.
+    step_weight: float = 2.0
+    answer_weight: float = 0.5
 
 
 def build_dataset(cfg: SFTConfig, tok):
@@ -75,16 +80,28 @@ def build_dataset(cfg: SFTConfig, tok):
         if len(ids) > cfg.max_len or not spans:
             dropped += 1
             continue
+        asst_texts = [m["content"] for m in r["messages"] if m["role"] == "assistant"]
         labels = [-100] * len(ids)
         weights = [0.0] * len(ids)
+        step_i = 0
         for turn_i, (s, e) in enumerate(spans):
-            w = 1.0 if cfg.late_turn_weight == 1.0 else (
-                1.0 + (cfg.late_turn_weight - 1.0) * (turn_i / max(1, len(spans) - 1)))
+            asst = asst_texts[turn_i]
+            if "<tool_call>" in asst:
+                step_i += 1
+                if cfg.step_weight > 1.0:
+                    w = 1.0 + (cfg.step_weight - 1.0) / step_i
+                else:
+                    w = 1.0
+            elif "<final_answer>" in asst:
+                w = cfg.answer_weight
+            else:
+                w = 1.0
             for i in range(s, min(e, len(ids))):
                 labels[i] = ids[i]
                 weights[i] = w
         examples.append({"input_ids": ids, "labels": labels, "weights": weights,
-                         "n_turns": len(spans), "meta": r.get("meta", {})})
+                         "n_turns": len(spans), "n_steps": step_i,
+                         "meta": r.get("meta", {})})
 
     print(f"[data] {len(examples)} examples kept, {dropped} dropped (too long / no assistant turn)")
     if examples:
@@ -119,7 +136,8 @@ def collate(batch, pad_id: int):
 
 
 class WeightedTrainerMixin:
-    """Token-weighted cross-entropy so `late_turn_weight` actually does something."""
+    """Token-weighted cross-entropy so the per-step weights (step_weight/answer_weight)
+    actually do something."""
 
     def compute_loss(self, model, inputs, return_outputs=False, **kw):
         import torch
