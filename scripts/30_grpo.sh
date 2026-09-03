@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 python3 -m atr.train.grpo \
   --model-id "${MODEL:-Qwen/Qwen3-1.7B}" \
-  --adapter "${ADAPTER:-artifacts/sft-1p7b}" \
+  --adapter "${ADAPTER:-artifacts/sft-1p7b-fixed}" \
   --out-dir "${OUT:-artifacts/grpo-1p7b}" \
   --group-size 8 --tasks-per-step 8 --steps 300 \
   --lr 2e-5 --temperature 1.0 --kl-beta 0.03 --micro-batch 2 \

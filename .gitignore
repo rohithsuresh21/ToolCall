@@ -1,4 +1,5 @@
 artifacts/*
 !artifacts/sft_sample.jsonl
+archive/*
 __pycache__/
 *.pyc
