@@ -39,6 +39,7 @@ class FilterConfig:
     forbid_unrequested_side_effects: bool = True
     max_answer_chars: int = 600
     max_per_task: int = 1                   # best-of-N per task -> keeps diversity honest
+    dedupe_by_question: bool = True         # one label per question STRING (see below)
     dedupe_by_shape: bool = True            # cap identical (type, tool-sequence) shapes
     max_per_shape: int = 400
     keep_recoveries: bool = True            # never drop a recovered-from-error trajectory for bloat
@@ -118,6 +119,38 @@ def filter_and_balance(records: Sequence[tuple[Task, Trajectory, ScoreCard]],
         take = group[: cfg.max_per_task]
         stats["drop:extra_sample"] += len(group) - len(take)
         picked.extend(take)
+
+    # --- one label per question STRING, across seeds
+    #
+    # The world is a pure function of the seed, but the QUESTION does not name the
+    # seed -- and the entity pools are small (10 people, 8 orgs, 6 cities). So the
+    # same sentence recurs across worlds carrying a different gold answer every
+    # time: in the 5850-record build, 798 of 2600 distinct questions had
+    # conflicting labels, one of them 49 different answers over 59 records, and
+    # 68.6% of all records were involved. Nothing in the prompt lets a model tell
+    # those apart, so they are unlearnable by construction -- the best available
+    # policy is to guess the marginal, and the gradient from the rest is noise.
+    #
+    # max_per_task does not catch this: task_id carries the seed, so every
+    # collision is a DIFFERENT task and each keeps its own trajectory.
+    #
+    # Keep the first occurrence of each question, drop the rest. Disambiguating the
+    # prompt instead (naming the world in the text) was the other option and is
+    # rejected on purpose: the judge's questions carry no such marker, so it would
+    # train a format the model never sees at eval.
+    if cfg.dedupe_by_question:
+        rng.shuffle(picked)     # seeded; avoids systematically favouring low seeds
+        seen_q: dict[str, str] = {}
+        out = []
+        for t, j, c in picked:
+            q = " ".join((t.prompt or "").split()).lower()
+            if q in seen_q:
+                stats["drop:duplicate_question" if seen_q[q] == (t.oracle_answer or "")
+                      else "drop:conflicting_question"] += 1
+                continue
+            seen_q[q] = t.oracle_answer or ""
+            out.append((t, j, c))
+        picked = out
 
     # --- shape cap: stops one trivial family dominating the gradient
     if cfg.dedupe_by_shape:

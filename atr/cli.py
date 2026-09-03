@@ -15,6 +15,7 @@ from .data.teacher import collect, dump, load
 from .eval.harness import (aggregate, evaluate, format_report, load_eval_config,
                            oracle_backend, save_run)
 from .tasks.generator import DEFAULT_MIX, dev_set, generate
+from .tasks.retrievability import assert_answer_retrievable
 from .tasks.schema import Task
 
 
@@ -65,6 +66,19 @@ def cmd_gen(args):
 def cmd_eval(args):
     fz = _frozen(args)
     tasks = _tasks_from(args)
+    # The oracle run is the sanity gate, and on its own it is blind to whether the
+    # plan retrieves the answer at all: oracle_backend replays the plan and then
+    # emits oracle_answer from a lookup table without reading a tool result, so it
+    # scores 100% either way. Check the data before scoring the verifiers.
+    if args.backend == "oracle" and not args.no_retrieval_check:
+        loader = load_naturalized_loader(args.cache) if getattr(args, "cache", None) else None
+        rep = assert_answer_retrievable(tasks, env=args.env, text_loader=loader)
+        print(f"[sanity] gold answer retrievable in {rep['n_scored'] - rep['unretrievable']}"
+              f"/{rep['n_scored']} oracle plans"
+              + (f" ({rep['n_skipped']} skipped: no plan or no gold string)"
+                 if rep["n_skipped"] else "")
+              + f"; answer already present before the last call in "
+                f"{rep['answer_before_last_call']}")
     be = oracle_backend(tasks) if args.backend == "oracle" else _backend(args)
     cards, trajs = evaluate(
         tasks, be, env=args.env,
@@ -105,6 +119,7 @@ def cmd_build(args):
         max_per_task=args.max_per_task,
         max_per_shape=args.max_per_shape,
         max_call_bloat=args.max_call_bloat,
+        dedupe_by_question=not args.keep_duplicate_questions,
         target_mix=DEFAULT_MIX if args.rebalance else None))
     print(json.dumps(summary, indent=2))
     stats = export(kept, args.out, ExportConfig(
@@ -200,6 +215,9 @@ def main(argv=None):
     e.add_argument("--loose-necessity", action="store_true")
     e.add_argument("--strict-match", action="store_true",
                    help="F13: refuse shotgun numeric answers and untagged replies")
+    e.add_argument("--no-retrieval-check", action="store_true",
+                   help="skip the --backend oracle assertion that each plan actually "
+                        "retrieves its own gold answer (the oracle score cannot see this)")
     e.set_defaults(fn=cmd_eval)
 
     c = sub.add_parser("collect", help="roll out trajectories for training data")
@@ -217,6 +235,10 @@ def main(argv=None):
                    help="cap kept trajectories per (family, route) shape; "
                         "raise it to scale the set past 3*400")
     b.add_argument("--max-call-bloat", type=float, default=2.0)
+    b.add_argument("--keep-duplicate-questions", action="store_true",
+                   help="keep records whose question string already appeared under "
+                        "another seed (they carry a different gold answer, so the "
+                        "pair is unlearnable); default is to keep the first only")
     b.add_argument("--rebalance", action="store_true")
     b.add_argument("--drop-thinking", action="store_true")
     b.add_argument("--max-thinking-chars", type=int, default=400)

@@ -9,6 +9,7 @@ from atr.data.rejection import FilterConfig, filter_and_balance
 from atr.data.teacher import collect, dump, load
 from atr.eval.harness import aggregate, evaluate, oracle_backend
 from atr.tasks.generator import dev_set, generate
+from atr.tasks.retrievability import assert_answer_retrievable
 from atr.tools.adapter import get_registry
 
 FAILS = []
@@ -87,9 +88,31 @@ o5, _ = evaluate(tasks, oracle_backend(tasks), cfg=LoopConfig(max_steps=10), pro
 agg5 = aggregate(o5)["overall"]
 check(agg5["success"] == 1.0, f"oracle success stays 1.0 on the single-tool toolset (got {agg5['success']})")
 
+# 4b. the oracle score above CANNOT see whether the plan retrieves its own answer:
+#     oracle_backend replays the plan, then emits oracle_answer from a lookup table
+#     without reading a tool result, so it prints 1.0 either way. Replay the plans
+#     through the real registry and check the passages that actually come back.
+ret = assert_answer_retrievable(tasks)
+check(ret["unretrievable"] == 0,
+      f"every oracle plan retrieves its own gold answer ({ret['n_scored']} scored, "
+      f"{ret['n_skipped']} skipped)")
+check(all(f["unretrievable"] == 0 for f in ret["by_family"].values()),
+      f"no family has an unretrievable answer ({ret['by_family']})")
+# ... and the answer must not be retrievable EARLY either. A hit before the last
+# call means the chain is truncatable: the model can stop short of its labelled
+# hop count and still be scored right, which is the same lazy policy the
+# disconnection filter exists to suppress. The generator's prefix-leak filter
+# rejects those candidates, so a non-zero count here means it regressed.
+check(ret["answer_before_last_call"] == 0,
+      f"no dev task leaks its answer before the terminal read "
+      f"({ret['answer_before_last_call']}/{ret['n_scored']} do)")
+
 # 5. multi-hop oracle trajectories really do perform dependent searches
 mh = [c for c in cards if c.task_type.startswith("musique")]
 check(all(c.num_calls >= 2 for c in mh), "multi-hop oracle trajectories make 2+ searches")
+# L relation steps == L+1 searches: L to walk the chain, 1 to read the leaf passage.
+check(all(len(t.oracle_plan) == t.difficulty + 1 for t in hop),
+      "every hop task plans difficulty+1 searches (chain walk + terminal read)")
 check(all(c.recovery_ok is None for c in cards), "no fabricated recovery events without recovery family")
 
 # 6. tokenisation spans line up with assistant turns

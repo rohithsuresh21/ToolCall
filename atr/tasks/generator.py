@@ -200,15 +200,22 @@ _REL = {
                            "the founder of {0}", "founder"),
 }
 
-# terminal attributes by leaf kind: fact_key -> (attr_question_word, answer_kind)
+# terminal attributes by leaf kind:
+#   fact_key -> (attr_question_word, answer_kind, query_keyword)
+#
+# `query_keyword` is what the FINAL search pairs with the leaf's own name to pull
+# the leaf passage. Walking the chain only ever reveals the leaf's NAME (it is
+# named by chain[L-1]'s passage); the attribute being asked for lives in the
+# leaf's own passage, which no chain-walking query retrieves. See
+# _build_route_oracle for why that terminal read is a separate hop.
 _LEAF_ATTR = {
-    "country":    {"official_language": ("official language ", "text"),
-                   "population": ("population ", "text")},
-    "city":       {"population": ("population ", "text"),
-                   "founded_in": ("year of foundation ", "numeric")},
-    "organisation": {"founded_in": ("year of foundation ", "numeric"),
-                     "field": ("field of activity ", "text")},
-    "person":     {"year_of_birth": ("year of birth ", "numeric")},
+    "country":    {"official_language": ("official language ", "text", "official language"),
+                   "population": ("population ", "text", "population")},
+    "city":       {"population": ("population ", "text", "population"),
+                   "founded_in": ("year of foundation ", "numeric", "founded")},
+    "organisation": {"founded_in": ("year of foundation ", "numeric", "founded"),
+                     "field": ("field of activity ", "text", "field")},
+    "person":     {"year_of_birth": ("year of birth ", "numeric", "born")},
 }
 
 # route templates by hop count: each is a list of _REL keys. Any leaf kind that
@@ -349,7 +356,24 @@ def _resolve_chain(w: World, rng: random.Random, steps: list[str]) -> list[dict]
 # shortcut-solvable and gets rejected, so the remaining pool genuinely requires
 # chaining. Empirically ~10% of naive chains trip this, so it is a real, worth-
 # filtering leak rather than dead code.
-_SHORTCUT_STATS = {"checked": 0, "rejected": 0}
+#
+# There are TWO leaks, and the single-search test above only catches the first.
+# A chain can also leak mid-way: the gold string turns up in the top-k of a call
+# BEFORE the terminal read, so the model can stop early and still be right. BM25
+# returns whole passages and co-retrieves neighbours, so this happens constantly
+# without any single search solving the question. Measured over the 6000 train
+# seeds this harness builds from, with the filter disabled: 51.9% of 4-hop and
+# 41.6% of both 2- and 3-hop tasks were answerable in fewer hops than their label
+# claimed (dev pool, 600 seeds: 24.1% / 11.8% / 42.7%). Most of those are invisible
+# to the single-search test -- it fires one query and these leak on hop 2 or 3 --
+# so this is a second axis, not a re-measurement of the first. It is the same lazy
+# behaviour the disconnection filter exists to prevent, one level down.
+# `_is_prefix_leaky` replays the actual plan and rejects on any pre-terminal hit.
+# Cost: none in train YIELD (8 routes x several leaf attributes per length means a
+# clean candidate always exists, so 100% of seeds still mint at every hop length);
+# it lands on the build instead, where the surviving questions are less varied and
+# dedupe_by_question drops more -- 2457 -> 1951 records off the same 6000 seeds.
+_SHORTCUT_STATS = {"checked": 0, "rejected": 0, "prefix_rejected": 0}
 
 
 def _norm_find(gold: dict) -> str:
@@ -368,25 +392,59 @@ def _is_shortcut_solvable(w: World, prompt: str, gold: dict) -> bool:
     if not want:
         return False
     for hit in res.get("results", []):
-        if want in norm_text(hit.get("text", "")):
+        if want in norm_text(f"{hit.get('title', '')} {hit.get('text', '')}"):
             return True
     return False
 
 
-def _leaf_attr_choice(w: World, rng: random.Random, leaf: dict) -> tuple[str, dict]:
-    """Pick a terminal attribute present on the leaf passage."""
+def _is_prefix_leaky(w: World, plan: list[dict], gold: dict) -> bool:
+    """True if the gold answer already appears in the top-k of a call BEFORE the
+    terminal read -- i.e. the chain can be truncated and still answered correctly.
+
+    Whether a leak exists depends on the leaf ATTRIBUTE, not just the route: asking
+    a country's population leaks through its capital's passage (the two carry the
+    same number by construction) while asking its official language does not. So
+    gen_musique retries the route's other terminal attributes before abandoning the
+    route -- rejecting the whole chain on the first leaky attribute would throw away
+    a usable question and starve the longer hop families."""
+    want = _norm_find(gold)
+    if not want:
+        return False
+    reg = get_registry("builtin")
+    for step in plan[:-1]:
+        res = reg.call(w, "search", dict(step["arguments"]))
+        for hit in res.get("results", []) or []:
+            # title AND text: the tool_response block renders both, so a gold
+            # answer that IS an entity name (a city, a country) leaks through the
+            # title of a co-retrieved passage even when its prose does not
+            # contain the string. Match what the model reads, not a subset.
+            if want in norm_text(f"{hit.get('title', '')} {hit.get('text', '')}"):
+                return True
+    return False
+
+
+def _leaf_attr_options(rng: random.Random, leaf: dict) -> list[tuple[str, dict, str, str]]:
+    """Every terminal attribute present on the leaf passage, in random order.
+
+    Each entry is (question_word, gold, answer, query_keyword); the keyword is what
+    the oracle's terminal read searches for alongside the leaf's name. This returns
+    all of them rather than one pick so gen_musique can fall through to the next
+    attribute when the shortcut or prefix-leak filter rejects a candidate."""
     opts = _LEAF_ATTR.get(leaf["kind"], {})
     avail = [k for k in opts if leaf["attrs"].get(k) is not None]
-    key = rng.choice(avail)
-    (word, kind) = opts[key]
-    val = leaf["attrs"][key]
-    if kind == "text" and key == "population":
-        gold = {"kind": "text", "value": f"{int(val):,}"}
-        answer = f"{int(val):,}"
-    else:
-        gold = {"kind": kind, "value": val, "tol": 0}
-        answer = str(val)
-    return word, gold, answer
+    rng.shuffle(avail)
+    out = []
+    for key in avail:
+        (word, kind, query_kw) = opts[key]
+        val = leaf["attrs"][key]
+        if kind == "text" and key == "population":
+            gold = {"kind": "text", "value": f"{int(val):,}"}
+            answer = f"{int(val):,}"
+        else:
+            gold = {"kind": kind, "value": val, "tol": 0}
+            answer = str(val)
+        out.append((word, gold, answer, query_kw))
+    return out
 
 
 def _phrase_chain(steps: list[str], chain: list[dict]) -> str:
@@ -398,22 +456,35 @@ def _phrase_chain(steps: list[str], chain: list[dict]) -> str:
     return phrase
 
 
-def _build_route_oracle(steps: list[str], chain: list[dict]) -> list[dict]:
-    """One search per hop. Query = the CURRENT (source) entity name + this hop's
-    relation kw, i.e. search what you already know to DISCOVER the next entity.
+def _build_route_oracle(steps: list[str], chain: list[dict], leaf_kw: str) -> list[dict]:
+    """L relation steps -> L+1 searches: L to WALK the chain, one to READ the leaf.
 
-    chain[k-1] ->(steps[k-1])-> chain[k]. Before hop k you only know chain[k-1]
-    (the prompt names chain[0]; each search reveals the next). So the query that
-    RETRIEVES chain[k]'s passage is chain[k-1]'s name + the relation keyword.
-    Searching chain[k]'s name instead (the destination) would require knowing it
-    before the search -- an off-by-one that taught SFT to emit "psychic" first
-    searches (a confident proper noun absent from the prompt, e.g. "Aether
-    Dynamics"), since it imitated these broken plans verbatim.
+    Query = the CURRENT (source) entity name + this hop's relation kw, i.e. search
+    what you already know to DISCOVER the next entity. chain[k-1]
+    ->(steps[k-1])-> chain[k]. Before hop k you only know chain[k-1] (the prompt
+    names chain[0]; each search reveals the next). So the query that RETRIEVES
+    chain[k]'s passage is chain[k-1]'s name + the relation keyword. Searching
+    chain[k]'s name instead (the destination) would require knowing it before the
+    search -- an off-by-one that taught SFT to emit "psychic" first searches (a
+    confident proper noun absent from the prompt, e.g. "Aether Dynamics"), since
+    it imitated these broken plans verbatim.
+
+    The TERMINAL READ is why there are L+1 and not L searches. Walking the chain
+    ends with chain[L-1]'s passage, which NAMES the leaf but does not carry the
+    leaf's own attributes -- and the attribute is the answer. With L searches the
+    gold string was simply absent from the transcript for ~50% of tasks (worse on
+    dev: the held-out person-leaf 4-hop shape reached 78%), and no eval caught it,
+    because MockBackend replays the plan and then emits oracle_answer from a
+    lookup table without ever reading a tool result. The leaf's NAME is legitimate
+    query material by this point -- the previous hop just returned it -- so this
+    hop is a read, not a second psychic search. `assert_answer_retrievable` is the
+    check that holds this property; run it whenever the routes or passages change.
     """
     plan = []
     for k in range(1, len(chain)):
         _, _, _, _, kw = _REL[steps[k - 1]]
         plan.append({"name": "search", "arguments": {"query": f"{chain[k - 1]['name']} {kw}"}})
+    plan.append({"name": "search", "arguments": {"query": f"{chain[-1]['name']} {leaf_kw}"}})
     return plan
 
 
@@ -428,28 +499,37 @@ def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: s
             continue
         # A "bridge" is every entity in the chain except the final leaf.
         leaf = chain[-1]
-        attr_word, gold, answer = _leaf_attr_choice(w, rng, leaf)
         phrase = _phrase_chain(steps, chain)
-        prompt = f"What is the {attr_word}of {phrase}?"
-        if filter_shortcuts:
-            # Reject if one un-chained BM25 `search` on the FULL question text
-            # already surfaces the gold answer (MuSiQue disconnection filtering).
-            # Count the attempt regardless of outcome so the rejection rate is
-            # observable.
-            _SHORTCUT_STATS["checked"] += 1
-            if _is_shortcut_solvable(w, prompt, gold):
-                _SHORTCUT_STATS["rejected"] += 1
-                continue
-        plan = _build_route_oracle(steps, chain)
-        return Task(
-            task_id=_tid(task_type, seed), seed=seed, prompt=prompt,
-            task_type=task_type, difficulty=hops, gold=gold,
-            required_tools=list(ALL_TOOLS), required_any=[["search"]],
-            forbidden_tools=[],
-            oracle_plan=plan,
-            oracle_answer=answer,
-            route=list(steps),
-            notes=f"{hops}-hop retrieval chain; {len(plan)} dependent searches")
+        # Try every terminal attribute this leaf offers before giving up on the
+        # route: leakiness is a property of (route, attribute), not of the route
+        # alone, so one leaky attribute must not cost us the whole chain.
+        for attr_word, gold, answer, leaf_kw in _leaf_attr_options(rng, leaf):
+            prompt = f"What is the {attr_word}of {phrase}?"
+            plan = _build_route_oracle(steps, chain, leaf_kw)
+            if filter_shortcuts:
+                # Two leaks, checked cheapest first. (a) one un-chained BM25
+                # `search` on the FULL question text already surfaces the gold
+                # answer (MuSiQue disconnection filtering); (b) the plan's own
+                # pre-terminal calls already surface it, so the chain can be
+                # truncated. Count the attempt regardless of outcome so both
+                # rejection rates stay observable.
+                _SHORTCUT_STATS["checked"] += 1
+                if _is_shortcut_solvable(w, prompt, gold):
+                    _SHORTCUT_STATS["rejected"] += 1
+                    continue
+                if _is_prefix_leaky(w, plan, gold):
+                    _SHORTCUT_STATS["prefix_rejected"] += 1
+                    continue
+            return Task(
+                task_id=_tid(task_type, seed), seed=seed, prompt=prompt,
+                task_type=task_type, difficulty=hops, gold=gold,
+                required_tools=list(ALL_TOOLS), required_any=[["search"]],
+                forbidden_tools=[],
+                oracle_plan=plan,
+                oracle_answer=answer,
+                route=list(steps),
+                notes=f"{hops}-hop retrieval chain; {len(plan)} dependent searches "
+                      f"({hops} to walk the chain + 1 terminal read of the leaf passage)")
     return None
 
 
