@@ -71,12 +71,13 @@ class RewardConfig:
     w_progress: float = 0.20
     w_reformulate: float = 0.10
     clip_low: float = -1.0
-    # Max positive sum is 1.00+0.30+0.10+0.10+0.05+0.05+0.10 = 1.70 from the
-    # outcome/selection/args/format/recovery terms, plus 0.45 from the per-hop
-    # chain shaping (w_anchor+w_progress+w_reformulate) = 2.15. The ceiling must
-    # clear this so a perfect episode never clips, which would silently erase the
-    # small shaping terms inside a group (w_recovery AND the hop terms).
-    clip_high: float = 2.3
+    # Max positive sum is 1.00+0.30+0.10+0.10+0.05+0.05+0.10 = 1.70. The per-hop
+    # chain shaping (w_anchor+w_progress+w_reformulate = +0.45) fires ONLY on
+    # failed episodes, so it never stacks with the outcome terms on a solved task
+    # and does not raise the ceiling. At a ceiling that did not clear 1.70 an
+    # otherwise-perfect episode would clip, silently erasing w_recovery -- exactly
+    # the term we most want visible inside a group -- so 1.8 keeps it clear.
+    clip_high: float = 1.8
 
 
 def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None) -> tuple[float, dict]:
@@ -95,13 +96,20 @@ def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None)
     # Per-hop chain shaping. `reformulate` is gated on genuine forward progress so
     # a policy that fires three random entity names cannot collect it for "moving
     # to a different string" -- it must actually advance along the oracle chain.
-    anchor_ok = card.detail.get("anchor_ok")
-    if anchor_ok is not None:
-        parts["anchor"] = cfg.w_anchor * float(anchor_ok)
-        progress = float(card.detail.get("progress_frac") or 0.0)
-        parts["progress"] = cfg.w_progress * progress
-        if progress > 0 and card.detail.get("reformulate_ok"):
-            parts["reformulate"] = cfg.w_reformulate * float(card.detail.get("reformulate_frac") or 0.0)
+    # The three terms are ONLY credit for a FAILED episode: they exist to give
+    # partial gradient on hard chains that solved the hops but missed the final
+    # answer, so the outcome terms never stack with them on a solved task. On a
+    # success the answer is already fully rewarded by success+final_f1, so the
+    # shaping contributes nothing (no double-counting), which keeps the max
+    # positive sum at the collaborator's 1.70 and the ceiling at 1.8.
+    if not card.success:
+        anchor_ok = card.detail.get("anchor_ok")
+        if anchor_ok is not None:
+            parts["anchor"] = cfg.w_anchor * float(anchor_ok)
+            progress = float(card.detail.get("progress_frac") or 0.0)
+            parts["progress"] = cfg.w_progress * progress
+            if progress > 0 and card.detail.get("reformulate_ok"):
+                parts["reformulate"] = cfg.w_reformulate * float(card.detail.get("reformulate_frac") or 0.0)
 
     if card.side_effect_ok is False and not task.expect_side_effect:
         parts["side_effect"] = -cfg.p_side_effect
