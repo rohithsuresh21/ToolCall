@@ -74,6 +74,8 @@ class GRPOConfig:
     max_new_tokens: int = 512
     max_steps_per_episode: int = 10
     max_len: int = 4096
+    rollout_chunk: int = 8                # max rollout episodes per generate() call
+                                          # (bounds VRAM; no chunking -> CUDA OOM)
     repeat_guard: int = 3                 # F14: env feedback during training rollouts;
                                           # official-style runs should use 0 (see configs/eval.json)
 
@@ -144,47 +146,58 @@ class _PolicyBackend(Backend):
     def __init__(self, model, tok, cfg: GRPOConfig):
         self.model, self.tok, self.cfg = model, tok, cfg
         self.use_chatml = True
+        # Rollouts are generated in sub-batches of at most this many episodes.
+        # Without chunking, _PolicyBackend.generate feeds the WHOLE live set
+        # (esp. with dynamic_sampling's batch_multiplier) into one generate()
+        # call, whose KV cache + logits blow well past the VRAM budget
+        # (observed CUDA OOM at ~44 GiB on a 47 GiB RTX 6000). Chunking bounds
+        # the peak activation footprint regardless of group_size/tasks_per_step.
+        self.rollout_chunk = max(1, getattr(cfg, "rollout_chunk", 8))
 
     def generate(self, batch, tools=None, sp=None, ids=None):
         import torch
         sp = sp or SamplingParams()
-        texts = [self._render(m, tools) for m in batch]
-        self.tok.padding_side = "left"
-        enc = self.tok(texts, return_tensors="pt", padding=True,
-                       add_special_tokens=False).to(self.model.device)
-        # Rollouts must run in clean inference mode. During training the policy
-        # is in train() with gradient checkpointing ON, both of which corrupt
-        # sampling: train dropout degrades output and grad-checkpointing forces
-        # use_cache=False, which together produce gibberish instead of tool
-        # calls. Dropout is only ever active because we are mid-training; here
-        # we temporarily switch to eval + no-checkpoint for a correct, cached
-        # forward, then restore the exact previous state.
-        was_training = self.model.training
-        cache = getattr(self.model.config, "use_cache", None)
-        gc_enabled = getattr(self.model, "_is_gradient_checkpointing", None)
-        if was_training:
-            self.model.eval()
-        if gc_enabled:
-            self.model.gradient_checkpointing_disable()
-        self.model.config.use_cache = True
-        try:
-            with torch.no_grad():
-                gen = self.model.generate(
-                    **enc, max_new_tokens=sp.max_tokens, do_sample=sp.temperature > 0,
-                    temperature=max(sp.temperature, 1e-5), top_p=sp.top_p,
-                    top_k=getattr(sp, "top_k", None),
-                    pad_token_id=self.tok.pad_token_id)
-        finally:
-            self.model.config.use_cache = cache
-            if gc_enabled:
-                self.model.gradient_checkpointing_enable()
+        outs: list[str] = []
+        chunk = self.rollout_chunk
+        for start in range(0, len(batch), chunk):
+            chunk_batch = batch[start:start + chunk]
+            texts = [self._render(m, tools) for m in chunk_batch]
+            self.tok.padding_side = "left"
+            enc = self.tok(texts, return_tensors="pt", padding=True,
+                           add_special_tokens=False).to(self.model.device)
+            # Rollouts must run in clean inference mode. During training the
+            # policy is in train() with gradient checkpointing ON, both of
+            # which corrupt sampling: train dropout degrades output and
+            # grad-checkpointing forces use_cache=False, which together produce
+            # gibberish instead of tool calls. Dropout is only ever active
+            # because we are mid-training; here we temporarily switch to eval +
+            # no-checkpoint for a correct, cached forward, then restore the
+            # exact previous state.
+            was_training = self.model.training
+            cache = getattr(self.model.config, "use_cache", None)
+            gc_enabled = getattr(self.model, "_is_gradient_checkpointing", None)
             if was_training:
-                self.model.train()
-        from .grpo import _cut  # local import keeps this file self-contained
-        outs = []
-        for i in range(len(batch)):
-            new = gen[i][enc["input_ids"].shape[1]:]
-            outs.append(_cut(self.tok.decode(new, skip_special_tokens=True), sp.stop))
+                self.model.eval()
+            if gc_enabled:
+                self.model.gradient_checkpointing_disable()
+            self.model.config.use_cache = True
+            try:
+                with torch.no_grad():
+                    gen = self.model.generate(
+                        **enc, max_new_tokens=sp.max_tokens, do_sample=sp.temperature > 0,
+                        temperature=max(sp.temperature, 1e-5), top_p=sp.top_p,
+                        top_k=getattr(sp, "top_k", None),
+                        pad_token_id=self.tok.pad_token_id)
+            finally:
+                self.model.config.use_cache = cache
+                if gc_enabled:
+                    self.model.gradient_checkpointing_enable()
+                if was_training:
+                    self.model.train()
+            from .grpo import _cut  # local import keeps this file self-contained
+            for i in range(len(chunk_batch)):
+                new = gen[i][enc["input_ids"].shape[1]:]
+                outs.append(_cut(self.tok.decode(new, skip_special_tokens=True), sp.stop))
         return outs
 
 
