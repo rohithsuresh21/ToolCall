@@ -30,6 +30,12 @@ Deliberate choices worth arguing about:
   successful ones efficiency is handled multiplicatively by `scale_by_efficiency`
   (F7) -- OTC-PO showed the additive form is gameable while the multiplicative
   form cut redundant calls sharply at equal accuracy.
+* Under-calling is penalised symmetrically (`missing_calls`, per shortfall call,
+  gated on the task genuinely requiring hops). Without it the `extra_calls` budget
+  check is one-sided: a brevity-seeking policy can stop one hop short of a multi-hop
+  chain, earn nothing for the omitted hops, and never trip the over-budget penalty --
+  so collapsing to "answer from partial evidence" carries zero downside. Charging
+  the missing hops (scaled by `len(task.oracle_plan)`) restores that downside.
 * Truncated episodes (generation hit the token cap mid-stream, F5) take a soft
   penalty AND are masked out of the gradient in grpo.encode -- DAPO's overlong
   shaping: a rambling answer must never be rewarded just because one number in
@@ -60,6 +66,8 @@ class RewardConfig:
     p_necessity: float = 0.20          # used tools on a no-tool task, or vice versa
     p_per_extra_call: float = 0.04     # failed episodes only (see scale_by_efficiency)
     p_extra_call_cap: float = 0.24
+    p_per_missing_call: float = 0.06   # failed episodes only; under-call on a multi-hop chain
+    p_missing_call_cap: float = 0.24
     p_no_answer: float = 0.20          # anti-abstention guard; see module docstring
     p_truncated: float = 0.15          # F5: generation was cut off mid-stream
     # Per-hop chain shaping for the multi-hop collapse (GRPO only). These dense
@@ -125,6 +133,17 @@ def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None)
     # policy against calling tools even on tasks that legitimately need more.
     if extra and not card.success:
         parts["extra_calls"] = -min(cfg.p_extra_call_cap, extra * cfg.p_per_extra_call)
+    missing = max(0, budget - card.num_calls)
+    # Under-call penalty (symmetric to extra_calls). A brevity-seeking policy can
+    # collapse to stopping before it completes the oracle chain (e.g. 3 of 4 hops):
+    # it earns no reward for the omitted hops and never trips the extra_calls budget
+    # check, so there is zero downside to answering from partial evidence. Charge a
+    # per-call penalty scaled by `oracle_plan` length (the per-task budget), applied
+    # to FAILED episodes only and gated on the task genuinely requiring hops/tools,
+    # so a legitimately tool-free answer on a no-tool task is never penalised. A
+    # successful episode has already been rewarded (and F7-scaled) and is left alone.
+    if missing and not card.success and len(task.oracle_plan) > 0:
+        parts["missing_calls"] = -min(cfg.p_missing_call_cap, missing * cfg.p_per_missing_call)
     if card.detail.get("answer_reason") == "no_answer":
         parts["no_answer"] = -cfg.p_no_answer
     if card.detail.get("truncated"):
@@ -184,3 +203,91 @@ def group_advantages(rewards: list[float], eps: float = 1e-4,
     if std < eps:
         return [0.0] * n          # dead group: no signal, contribute nothing
     return [c / (std + eps) for c in centred]
+
+
+def mean_abs_dev(rewards: list[float], mean: float | None = None) -> float:
+    """Mean absolute deviation (MAD) of a reward list (0 if empty)."""
+    n = len(rewards)
+    if n == 0:
+        return 0.0
+    if mean is None:
+        mean = sum(rewards) / n
+    return sum(abs(r - mean) for r in rewards) / n
+
+
+def group_advantages_planb(rewards: list[float], eps: float = 1e-4,
+                           scale: str = "std",
+                           baseline: str = "group",
+                           sign_baseline: float = 0.0) -> list[float]:
+    """Plan B advantage estimator.
+
+    `baseline` selects the reference subtracted from every reward:
+      * "group" - the within-group mean (current / GRPO behaviour)
+      * "sign"  - a FIXED reference (`sign_baseline`). When a group's G rewards are
+                  all identical (the all-fail / all-pass dead group), "group" gives
+                  zero advantage for every sample -> no gradient. "sign" gives every
+                  sample (r - sign_baseline), which is non-zero unless everyone lands
+                  exactly on the baseline, so dead groups finally produce a signal.
+
+    `scale` selects the denominator used to normalise that centred reward:
+      * "std" - standard deviation (current / GRPO behaviour)
+      * "mad" - mean absolute deviation. MathForge DGAE shows std-normalisation makes
+                the total update magnitude proportional to sqrt(p(1-p)), which peaks
+                at p=0.5 and suppresses BOTH easy and (critically) hard questions.
+                Dividing by MAD makes the total update magnitude constant per group,
+                decoupling update strength from difficulty.
+      * "none" - no division (pure fixed-baseline advantage).
+
+    With the pre values (scale="std", baseline="group") this is bit-identical to
+    `group_advantages(rewards, eps, std_normalise=True)`.
+    """
+    n = len(rewards)
+    if n == 0:
+        return []
+
+    if baseline == "group":
+        reference = sum(rewards) / n
+        centred = [r - reference for r in rewards]
+    else:  # "sign" -> fixed baseline
+        centred = [r - sign_baseline for r in rewards]
+
+    if scale == "none":
+        return centred
+    if scale == "mad":
+        mad = mean_abs_dev(rewards, reference if baseline == "group" else sign_baseline)
+        if mad < eps:
+            # Every sample equals the reference -> no spread at all. Under "group"
+            # this is the true dead group (no signal); replicate that for MAD.
+            return [0.0] * n
+        return [c / (mad + eps) for c in centred]
+    # "std"
+    var = sum(c * c for c in centred) / n
+    std = var ** 0.5
+    if std < eps:
+        return [0.0] * n
+    return [c / (std + eps) for c in centred]
+
+
+def dqw_weights(mean_rewards: list[float], temp: float = 2.2,
+                eps: float = 1e-9) -> list[float]:
+    """Difficulty-aware question weighting (MathForge DQW).
+
+    Weight a group by softmax(-mean_reward / temp) so that harder groups (lower
+    mean reward) get MORE relative weight while easy groups (higher mean reward)
+    are only mildly suppressed. `temp` is set from the empirical reward scale so
+    the max:min weight ratio stays modest (e.g. temp=2.2 keeps it ~1.6x) -- enough
+    to favour hard-but-solvable groups without starving the easy ones that already
+    work. The weights are normalised so they sum to len(mean_rewards).
+    """
+    n = len(mean_rewards)
+    if n == 0:
+        return []
+    import math
+    logs = [-(m / temp if temp > 0 else 0.0) for m in mean_rewards]
+    mx = max(logs)                       # shift for numerical stability
+    exps = [math.exp(x - mx) for x in logs]
+    s = sum(exps)
+    if s < eps:
+        return [1.0] * n
+    w = [e / s * n for e in exps]        # mean weight == 1
+    return w

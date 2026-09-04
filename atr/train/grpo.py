@@ -50,12 +50,13 @@ from typing import Sequence
 
 from ..agent.backends import Backend, SamplingParams
 from ..agent.chatml import assistant_spans
-from ..agent.loop import LoopConfig, Trajectory, run_episodes
+from ..agent.loop import LoopConfig, run_episodes
 from ..tasks.generator import DEFAULT_MIX, dev_set, generate
 from ..tasks.schema import Task
 from ..tasks.verifiers import score as score_traj
 from ..tools.adapter import get_registry
-from .reward import RewardConfig, compute_reward, group_advantages, scale_by_efficiency
+from .reward import (RewardConfig, compute_reward, dqw_weights, group_advantages,
+                     group_advantages_planb, scale_by_efficiency)
 
 
 @dataclass
@@ -128,6 +129,37 @@ class GRPOConfig:
     curriculum_feedback: bool = True
     dead_group_window: int = 5            # rolling window of frac_dead_groups fed back
     dead_group_threshold: float = 0.5     # same number the README advises a human to watch
+    # Plan B, Fix-3: which dead-group fraction feeds curriculum_feedback.
+    #   "discarded"   - the true fraction of sampled groups discarded by dynamic
+    #                   sampling because every rollout was dead (the real signal).
+    #   "recompute"   - the PRE-IMPLEMENTATION behaviour: fraction of dead groups
+    #                   within the already-filtered (mostly-live) pool, which reads
+    #                   ~0.0 and so never triggers the safety valve. Kept so the
+    #                   original (broken) behaviour is one knob away.
+    dead_frac_source: str = "recompute"
+
+    # Plan B, Fix-1 + Fix-2: advantage estimator knobs (see reward.group_advantages_planb).
+    #   advantage_scale:    "std" (pre) | "mad" | "none"
+    #   advantage_baseline: "group" (pre) | "sign"
+    #   sign_baseline:      fixed reference used when advantage_baseline == "sign".
+    #                       On the reward scale here (solved ~1.4-1.7, dead ~0-0.3)
+    #                       sign_baseline=0.5 keeps a fully-failed group's advantage
+    #                       negative (an explorable signal) without over-ranging.
+    advantage_scale: str = "std"
+    advantage_baseline: str = "group"
+    sign_baseline: float = 0.5
+
+    # Plan B, Fix-2b: Difficulty-Aware Question-level Weighting (MathForge DQW).
+    # Re-weights each group's advantage by softmax(-mean_reward / dqw_temp) so hard
+    # groups get more attention. Gated OFF (pre) by default; dqw_temp is tuned from
+    # the empirical reward scale to keep the easy groups near full weight.
+    dqw: bool = False
+    dqw_temp: float = 2.2
+
+    # Plan B, Fix-4: E2H-G (Gaussian) curriculum schedule. Replaces the step-only
+    # easy->default->hard ramp with a soft schedule that keeps easy exposure early
+    # (protecting 2/3-hop) and fades it gradually while exposing hard tasks earlier.
+    e2h_curriculum: bool = False
     seed_start: int = 1_000_000
     seed_span: int = 400_000
     seed: int = 0
@@ -285,6 +317,7 @@ class GRPOTrainer:
         # rolling frac_dead_groups fed into _stage_mix by curriculum_feedback;
         # maintained in train(), capped at dead_group_window entries
         self.dead_frac_window: list[float] = []
+        self._last_group_stats: list[dict] = []
 
     # -- 1. sample -------------------------------------------------------
     # Difficulty here is CHAIN LENGTH -- the only axis left once the eval is
@@ -313,6 +346,30 @@ class GRPOTrainer:
         raw = {k: (1 - t) * a.get(k, 0.0) + t * b.get(k, 0.0) for k in keys}
         s = sum(raw.values()) or 1.0
         return {k: v / s for k, v in raw.items()}
+
+    # Plan B Fix-4 (E2H-G). A smooth Gaussian-CDF interpolation from the CURRICULUM_EASY
+    # tier toward CURRICULUM_HARD as a function of the (feedback-adjusted) step
+    # fraction f. Compared to the step-only ramp this:
+    #   * keeps the mix very easy for the first ~25% of training (protects 2/3-hop
+    #     while the policy warms up),
+    #   * crosses the halfway point around f=0.70 (MU) - DELIBERATELY tuned safe:
+    #     the fade happens later than an aggressive MU=0.55 so 2+3-hop stay >=~0.78
+    #     mid-training (only ~11pts below the pre-baseline that held 0.90 to step 218)
+    #     instead of dropping to 0.70. This is the no-degradation guard for 2/3-hop.
+    #   * BUT still exposes 4-hop from ~step 130 onward (SIGMA widens the ramp), so the
+    #     hard questions are not starved either - 4-hop reaches ~0.44 by step 300.
+    #   * NEVER reaches 100% hard: the easy tier keeps ~4% weight at f=1, so easy
+    #     tasks are faded out gradually, never switched off. That soft floor, combined
+    #     with DQW's temperature floor keeping easy groups near full weight, is what
+    #     stops 2/3-hop from regressing.
+    E2H_MU = 0.70
+    E2H_SIGMA = 0.25
+
+    def _e2h_g(self, f: float) -> float:
+        return 0.5 * (1.0 + math.erf((f - self.E2H_MU) / (self.E2H_SIGMA * math.sqrt(2.0))))
+
+    def _e2h_mix(self, f: float) -> dict:
+        return self._lerp_mix(self.CURRICULUM_EASY, self.CURRICULUM_HARD, self._e2h_g(f))
 
     def _rolling_dead_mean(self) -> float:
         """Mean frac_dead_groups over the feedback window (empty window -> 0)."""
@@ -343,8 +400,14 @@ class GRPOTrainer:
         return f * (1.0 - pullback)
 
     def _stage_mix(self, step: int) -> dict:
-        """easy (f<0.3) -> default mix (0.3-0.65) -> hard (f>0.7), linear in between."""
+        """easy (f<0.3) -> default mix (0.3-0.65) -> hard (f>0.7), linear in between.
+
+        With Fix-4 (e2h_curriculum) this instead follows the Gaussian E2H-G schedule,
+        which keeps easy exposure early and fades it gradually (never to zero).
+        """
         f = self._curriculum_fraction(step)
+        if self.cfg.e2h_curriculum:
+            return self._e2h_mix(f)
         if f < 0.30:
             return self._lerp_mix(self.CURRICULUM_EASY, self.cfg.task_mix, f / 0.30)
         if f < 0.70:
@@ -402,6 +465,23 @@ class GRPOTrainer:
             L += 1 + len(step.tool_calls)
         return hashes
 
+    def _base_adv(self, rewards: list[float]) -> list[float]:
+        """Per-group base advantage honouring the Plan B advantage knobs.
+
+        With the pre values (scale="std", baseline="group") this is bit-identical to
+        the original `group_advantages(rewards, std_normalise=cfg.std_normalise)`.
+        """
+        scale = self.cfg.advantage_scale
+        baseline = self.cfg.advantage_baseline
+        if scale == "std" and baseline == "group":
+            return group_advantages(rewards, std_normalise=self.cfg.std_normalise)
+        return group_advantages_planb(
+            rewards,
+            scale=scale,
+            baseline=baseline,
+            sign_baseline=self.cfg.sign_baseline,
+        )
+
     def assign_advantages(self, records: list[dict]) -> dict:
         groups: dict[str, list[dict]] = {}
         for r in records:
@@ -410,7 +490,25 @@ class GRPOTrainer:
 
         lam = self.cfg.efficiency_lambda
         dead = 0
-        for gid, rs in groups.items():
+        group_stats: list[dict] = []
+        gids: list[str] = list(groups)
+        mean_rewards: list[float] = []
+
+        # Plan B Fix-2b (DQW): group difficulty weights derived from mean rewards.
+        base_mean = []
+        for gid in gids:
+            rs = groups[gid]
+            rws = [r["reward"] for r in rs]
+            if lam > 0:
+                rws = scale_by_efficiency(
+                    rws, [r["card"].num_calls for r in rs],
+                    [bool(r["card"].success) for r in rs], lam)
+            base_mean.append(sum(rws) / len(rws) if rws else 0.0)
+        mean_rewards = base_mean
+        dw = dqw_weights(mean_rewards, temp=self.cfg.dqw_temp) if self.cfg.dqw else [1.0] * len(gids)
+
+        for gi, gid in enumerate(gids):
+            rs = groups[gid]
             rewards = [r["reward"] for r in rs]
             if lam > 0:                        # F7 multiplicative efficiency
                 rewards = scale_by_efficiency(
@@ -418,7 +516,8 @@ class GRPOTrainer:
                     [r["card"].num_calls for r in rs],
                     [bool(r["card"].success) for r in rs],
                     lam)
-            ep = group_advantages(rewards, std_normalise=self.cfg.std_normalise)
+            ep = self._base_adv(rewards)
+            w = dw[gi]                         # DQW group weight (1.0 when off)
 
             micro: list[list[float]] = [[0.0] * len(r["traj"].steps) for r in rs]
             if self.cfg.gigpo:
@@ -429,16 +528,15 @@ class GRPOTrainer:
                 for members in anchors.values():
                     if len(members) < 2:
                         continue               # no peers at this state -> no signal
-                    adv = group_advantages([rewards[i] for i, _ in members],
-                                           std_normalise=self.cfg.std_normalise)
+                    adv = self._base_adv([rewards[i] for i, _ in members])
                     for (i, k), a in zip(members, adv):
                         micro[i][k] = self.cfg.gigpo_omega * a
 
             live_group = False
             for i, r in enumerate(rs):
-                ta = [ep[i] + m for m in micro[i]]
+                ta = [w * (ep[i] + m) for m in micro[i]]
                 r["turn_advantages"] = ta
-                r["advantage"] = ep[i]
+                r["advantage"] = w * ep[i]
                 if any(abs(x) > 1e-8 for x in ta):
                     live_group = True
             r_live = live_group
@@ -447,6 +545,11 @@ class GRPOTrainer:
             if not live_group:
                 dead += 1
 
+            # Diagnostic group stats for reading a run (not used by any decision).
+            group_stats.append({"group": gid, "n": len(rs), "mean_reward": round(mean_rewards[gi], 4),
+                                "dqw_weight": round(w, 4), "live": bool(r_live)})
+
+        self._last_group_stats = group_stats
         return {"n_groups": len(groups), "dead_groups": dead,
                 "frac_dead_groups": round(dead / max(1, len(groups)), 3),
                 "frac_void_episodes": round(
@@ -588,7 +691,7 @@ class GRPOTrainer:
         target = self.cfg.tasks_per_step
         pool: list[dict] = []
         seen: set[str] = set()
-        gen_batches, discarded = 0, 0
+        gen_batches, discarded, total_groups = 0, 0, 0
         while gen_batches < max(1, self.cfg.max_gen_batches):
             n = target * (self.cfg.batch_multiplier if gen_batches == 0 else 2)
             tasks = self.sample_tasks(min(n, self.cfg.seed_span))
@@ -596,6 +699,7 @@ class GRPOTrainer:
             self.assign_advantages(records)
             fresh = []
             for gid in dict.fromkeys(r["group"] for r in records):
+                total_groups += 1                 # every sampled group counts here
                 grp = [r for r in records if r["group"] == gid]
                 if any(r.get("live") for r in grp):
                     if gid not in seen:
@@ -610,8 +714,11 @@ class GRPOTrainer:
             gen_batches += 1
             if not self.cfg.dynamic_sampling or len(seen) >= target:
                 break
+        # Plan B Fix-3: TRUE dead fraction = discarded sampled groups / all sampled.
+        # This is the signal that must feed curriculum_feedback, not the (near-zero)
+        # fraction recomputed inside the already-filtered pool.
         info = {"gen_batches": gen_batches, "discarded_groups": discarded,
-                "live_groups": len(seen)}
+                "live_groups": len(seen), "sampled_groups": total_groups}
         return pool, info
 
     @staticmethod
@@ -667,9 +774,22 @@ class GRPOTrainer:
             items = self.encode(records)
             ostats = self.optimise(items)
 
-            # feed the live dead-group diagnostic into the rolling window used by
-            # curriculum_feedback; keep at most dead_group_window entries
-            self.dead_frac_window.append(ginfo.get("frac_dead_groups", 0.0))
+            # Feed the dead-group fraction into the rolling window used by
+            # curriculum_feedback (kept at most dead_group_window entries).
+            #
+            # Plan B Fix-3: the source of the dead fraction is configurable.
+            #   "discarded" (post) - the TRUE fraction of sampled groups discarded by
+            #       dynamic sampling (all rollouts dead). This is the number that
+            #       should drive the safety valve; the old source read ~0 and so the
+            #       valve never fired even while 30+ groups/step were being thrown out.
+            #   "recompute" (pre)  - frac_dead_groups recomputed inside the already
+            #       filtered (mostly-live) pool, which reads ~0.0. Kept for A/B.
+            if self.cfg.dead_frac_source == "discarded":
+                tot = dinfo.get("sampled_groups", 0)
+                dead_frac = dinfo["discarded_groups"] / max(1, tot)
+            else:
+                dead_frac = ginfo.get("frac_dead_groups", 0.0)
+            self.dead_frac_window.append(dead_frac)
             if len(self.dead_frac_window) > max(1, self.cfg.dead_group_window):
                 self.dead_frac_window.pop(0)
 
@@ -678,6 +798,8 @@ class GRPOTrainer:
             pulled_back = (feedback and dg_mean > self.cfg.dead_group_threshold)
 
             rewards = [r["reward"] for r in records] or [0.0]
+            # Plan B diagnostics: the group composition actually trained on.
+            gstats = getattr(self, "_last_group_stats", [])
             row = {
                 "step": step,
                 "reward_mean": round(statistics.fmean(rewards), 4),
@@ -694,8 +816,13 @@ class GRPOTrainer:
                 "kl": round(ostats.get("kl", 0.0), 5),
                 "secs": round(time.time() - t0, 1),
                 **dinfo,
-                **{k: v for k, v in ginfo.items() if k != "frac_void_episodes"},
+                **{k: v for k, v in ginfo.items() if k not in ("frac_void_episodes",)},
                 "frac_void_episodes": ginfo.get("frac_void_episodes", 0.0),
+                # true dead fraction metric for the log (independent of the source knob)
+                "dead_frac_true": round(dinfo["discarded_groups"] / max(1, dinfo.get("sampled_groups", 0)), 4),
+                "n_live_groups": len([g for g in gstats if g["live"]]),
+                "grp_mean_rewards": [g["mean_reward"] for g in gstats],
+                "grp_dqw": [g["dqw_weight"] for g in gstats],
                 "dead_group_rolling_mean": round(dg_mean, 4),
                 "curriculum_pulled_back": bool(pulled_back),
             }

@@ -155,6 +155,7 @@ def main() -> None:
     ap.add_argument("--adapter", default=None)
     ap.add_argument("--tasks", default="artifacts/judge_tasks.jsonl")
     ap.add_argument("--out", default="artifacts/judge_eval")
+    ap.add_argument("--name", default=None, help="label used in the report header")
     ap.add_argument("--batch-size", type=int, default=27)
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--max-steps", type=int, default=8)
@@ -167,7 +168,8 @@ def main() -> None:
     cfg = {"temperature": args.temperature, "max_new_tokens": args.max_new_tokens,
            "max_steps": args.max_steps, "max_calls_per_turn": 1,
            "truncate_result_chars": 2000, "stop_on_empty_turn": True}
-    name = "SFT-adapter" if args.adapter else "BASE"
+    name = (args.name if args.name else
+            (("base-" + Path(args.adapter).name) if args.adapter else "BASE"))
     evaluate(recs, backend, cfg, args.batch_size, name, Path(args.out))
 
 
