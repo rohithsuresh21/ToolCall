@@ -68,6 +68,7 @@ class RewardConfig:
     p_extra_call_cap: float = 0.24
     p_per_missing_call: float = 0.06   # failed episodes only; under-call on a multi-hop chain
     p_missing_call_cap: float = 0.24
+    under_call_penalty: bool = True    # master switch (ablation arms A/B/C toggle this)
     p_no_answer: float = 0.20          # anti-abstention guard; see module docstring
     p_truncated: float = 0.15          # F5: generation was cut off mid-stream
     # Per-hop chain shaping for the multi-hop collapse (GRPO only). These dense
@@ -142,7 +143,7 @@ def compute_reward(task: Task, card: ScoreCard, cfg: RewardConfig | None = None)
     # to FAILED episodes only and gated on the task genuinely requiring hops/tools,
     # so a legitimately tool-free answer on a no-tool task is never penalised. A
     # successful episode has already been rewarded (and F7-scaled) and is left alone.
-    if missing and not card.success and len(task.oracle_plan) > 0:
+    if cfg.under_call_penalty and missing and not card.success and len(task.oracle_plan) > 0:
         parts["missing_calls"] = -min(cfg.p_missing_call_cap, missing * cfg.p_per_missing_call)
     if card.detail.get("answer_reason") == "no_answer":
         parts["no_answer"] = -cfg.p_no_answer

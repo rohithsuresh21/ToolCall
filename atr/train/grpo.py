@@ -109,6 +109,9 @@ class GRPOConfig:
     # --- F7 efficiency ---
     efficiency_lambda: float = 0.15       # 0 disables the multiplicative scaling
 
+    # --- F8 under-call penalty (4-hop collapse fix) ---
+    under_call_penalty: bool = True       # 0 disables the missing_calls penalty (ablation arms)
+
     # --- Lane B ---
     void_turn_filter: bool = True         # SimpleTIR: drop episodes with a no-op turn
     log_entropy: bool = True              # per-token action entropy; disable if it OOMs
@@ -311,7 +314,7 @@ class GRPOTrainer:
             [p for p in self.model.parameters() if p.requires_grad], lr=cfg.lr,
             betas=(0.9, 0.95), weight_decay=0.0)
         self.backend = _PolicyBackend(self.model, self.tok, cfg)
-        self.reward_cfg = RewardConfig()
+        self.reward_cfg = RewardConfig(under_call_penalty=cfg.under_call_penalty)
         self.history: list[dict] = []
         self.best: dict | None = None          # F6: best canary result so far
         # rolling frac_dead_groups fed into _stage_mix by curriculum_feedback;
