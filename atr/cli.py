@@ -44,6 +44,7 @@ def _frozen(args):
     ec = load_eval_config(getattr(args, "config", None))
     return {
         "temperature": args.temperature if args.temperature is not None else ec["temperature"],
+        "top_p": args.top_p if getattr(args, "top_p", None) is not None else ec["top_p"],
         "max_new_tokens": args.max_new_tokens if args.max_new_tokens is not None else ec["max_new_tokens"],
         "max_steps": args.max_steps if args.max_steps is not None else ec["max_steps"],
         "repeat_guard": args.repeat_guard if getattr(args, "repeat_guard", None) is not None else ec["repeat_guard"],
@@ -84,7 +85,8 @@ def cmd_eval(args):
         tasks, be, env=args.env,
         cfg=LoopConfig(max_steps=fz["max_steps"], repeat_guard=fz["repeat_guard"],
                        text_loader=load_naturalized_loader(args.cache) if args.cache else None),
-        sp=SamplingParams(temperature=fz["temperature"], max_tokens=fz["max_new_tokens"]),
+        sp=SamplingParams(temperature=fz["temperature"], top_p=fz["top_p"],
+                          max_tokens=fz["max_new_tokens"]),
         batch_size=args.batch_size, strict_necessity=not args.loose_necessity,
         strict_match=args.strict_match)
     rep = aggregate(cards)
@@ -102,7 +104,7 @@ def cmd_collect(args):
     recs = collect(tasks, be, env=args.env,
                    cfg=LoopConfig(max_steps=fz["max_steps"],
                                   text_loader=load_naturalized_loader(args.cache) if args.cache else None),
-                   sp=SamplingParams(temperature=fz["temperature"],
+                   sp=SamplingParams(temperature=fz["temperature"], top_p=fz["top_p"],
                                      max_tokens=fz["max_new_tokens"]),
                    samples_per_task=args.samples_per_task, batch_size=args.batch_size)
     n_ok = sum(c.success for _, _, c in recs)
@@ -202,6 +204,7 @@ def main(argv=None):
         sp.add_argument("--max-steps", type=int, default=None)
         sp.add_argument("--max-new-tokens", type=int, default=None)
         sp.add_argument("--temperature", type=float, default=None)
+        sp.add_argument("--top-p", type=float, default=None)
         sp.add_argument("--batch-size", type=int, default=64)
 
     g = sub.add_parser("gen", help="mint tasks to jsonl")
@@ -228,7 +231,10 @@ def main(argv=None):
 
     b = sub.add_parser("build", help="filter trajectories -> SFT jsonl")
     b.add_argument("inputs", nargs="+")
-    b.add_argument("--out", default="artifacts/sft.jsonl")
+    # Candidate, not the training path: promotion to data/sft.jsonl happens only
+    # after tests/audit_sft.py passes (scripts/10_build_data.sh). Defaulting this
+    # to artifacts/sft.jsonl is what let a gitignored build shadow the clean set.
+    b.add_argument("--out", default="artifacts/sft_candidate.jsonl")
     b.add_argument("--strict-format", action="store_true")
     b.add_argument("--max-per-task", type=int, default=1)
     b.add_argument("--max-per-shape", type=int, default=400,

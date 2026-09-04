@@ -36,7 +36,12 @@ python tests/verify_naturalize_live.py # needs artifacts/naturalized_passages.js
 # data
 python -m atr.cli gen --n 500 --out artifacts/tasks.jsonl
 python -m atr.cli collect --n 40 --backend oracle --samples-per-task 1 --out artifacts/raw_oracle.jsonl
-python -m atr.cli build artifacts/raw_*.jsonl --rebalance --max-per-task 1 --max-per-shape 2000 --out artifacts/sft.jsonl
+python -m atr.cli build artifacts/raw_*.jsonl --rebalance --max-per-task 1 --max-per-shape 2000 --out artifacts/sft_candidate.jsonl
+# ...then audit and promote to the COMMITTED training set (scripts/10_build_data.sh does both):
+python tests/audit_sft.py artifacts/sft_candidate.jsonl && mv artifacts/sft_candidate.jsonl data/sft.jsonl
+
+# judge task set: 54 public rows, rebuilt from the hub, byte-identical every run
+python scripts/make_judge_tasks.py            # -> data/judge_tasks.jsonl
 
 # GPU stages (bash scripts; env vars MODEL/ADAPTER/OUT override defaults)
 scripts/20_sft.sh   scripts/30_grpo.sh   scripts/40_eval.sh   scripts/60_merge_export.sh
@@ -234,9 +239,37 @@ logs: above ~0.5 the mix is too hard, so re-weight the curriculum toward difficu
 than raising the learning rate.
 
 **Frozen eval config.** `configs/eval.json` is read by `load_eval_config()` and shared by the
-CLI, the GRPO dev canary and `scripts/modal_app.py`, so internal numbers match official
-scoring conditions. Explicit CLI flags override it (`atr/cli.py::_frozen`); those flags default
-to `None` precisely so "not passed" stays distinguishable from an explicit value.
+CLI, the GRPO dev canary, `scripts/modal_app.py` and `scripts/judge_eval.py`, so internal numbers
+match official scoring conditions. Explicit CLI flags override it (`atr/cli.py::_frozen`); those
+flags default to `None` precisely so "not passed" stays distinguishable from an explicit value.
+
+Two ways this claim was false and is now enforced. `judge_eval.py` read none of it -- its own
+argparse defaults (temperature 0.2, max_steps 8) meant the one script scoring the judge's data
+sampled differently from every other eval in the repo. And `top_p` was declared in the config and
+passed by nobody: every `SamplingParams(...)` built from the frozen dict listed `temperature` and
+`max_tokens` only, so the dataclass default 0.8 silently won over the configured 1.0 in the CLI,
+the canary, modal and judge alike. **A knob in this file that no call site forwards is worse than
+no knob**, because it reads as a controlled variable in every report. If you add a field here,
+add it to `_frozen()` and to all four call sites.
+
+**vLLM's `max_lora_rank` is read from the adapter, never assumed.** It defaults to 16 and raises
+at engine construction when the adapter's `r` exceeds it, so serving any adapter this repo trains
+(`SFTConfig.lora_r` 32; `50_sft_4b.sh` r=64) under the default fails outright -- `40_eval.sh`, the
+vLLM dev eval, could not run against a trained adapter at all. `VLLMBackend` now derives it via
+`lora_rank_of()` reading the adapter's own `adapter_config.json`, rounded up to a supported bucket
+(8/16/32/64/128/256), with an explicit `max_lora_rank=` override for a hub id or merged checkpoint
+whose config it cannot read. Hardcoding 32 would have fixed today and broken silently the next
+time someone edited `--lora-r`; `tests/test_lora_rank.py` pins that, and needs neither vLLM nor a GPU.
+
+**One matcher for the score: `answer_f1`.** The repo has three answer comparisons and they
+disagree by multiples on the same string -- `match_answer` (substring containment; drives the
+internal `success` boolean), `norm_text` equality (strictly harsher than the judge), and
+`answer_f1` (token F1, the judge's metric). `judge_eval.py` used to headline the first two and
+import the third nowhere, which is how an `acc_exact` on the 54 real MuSiQue rows came to be
+compared against a `final_f1` on the 60 synthetic dev tasks and reported as a "5.67x backend
+ratio" between HF and vLLM. It was never a backend effect: the two numbers came from different
+scripts running different task sets under different metrics. **Only `answer_f1` may be quoted as
+a score**; `acc_exact` survives in `judge_eval.py` as an explicitly labelled diagnostic.
 
 **Passage naturalization is offline and opt-in.** `atr/data/naturalize.py` rewrites passage
 prose via an LLM under fact-preservation checks and writes a cache keyed `"seed:doc_id"`. It
@@ -250,7 +283,18 @@ assert that isolation.
 ## Conventions
 
 - `artifacts/` is gitignored except `artifacts/sft_sample.jsonl`. Committed data lives in
-  `data/sft.jsonl`. SFT records are `{messages, tools, meta}` JSONL, UTF-8.
+  `data/sft.jsonl` and `data/judge_tasks.jsonl`. SFT records are `{messages, tools, meta}`
+  JSONL, UTF-8.
+- **Training inputs come from `data/`, never `artifacts/`, and the gate enforces it.**
+  `20_sft.sh` and `50_sft_4b.sh` source `scripts/lib_data_gate.sh` and call
+  `require_clean_dataset`, which runs `tests/audit_sft.py` and refuses to start on
+  `DEFECTS PRESENT`, on a path under gitignored `artifacts/`, or when the audit cannot run at
+  all (a broken interpreter must not read as clean data). `10_build_data.sh` builds to
+  `artifacts/sft_candidate.jsonl` and promotes to `data/sft.jsonl` only after the same audit
+  passes. This exists because a stale pre-fix `artifacts/sft.jsonl` shadowed the committed clean
+  set and was trained on: 40.4% / 46.0% / 51.7% of its 2/3/4-hop records were answerable before
+  the terminal read. `eval --backend oracle` scores such a set 100% by construction, so the
+  audit is the only thing that can catch it.
 - Tests are plain scripts with a `check(cond, label)` helper and `sys.exit(1)` on failure —
   match that style rather than introducing pytest.
 - Module docstrings carry the design rationale ("why", not "what"), and several encode

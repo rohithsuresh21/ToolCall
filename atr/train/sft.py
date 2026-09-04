@@ -31,7 +31,7 @@ from pathlib import Path
 @dataclass
 class SFTConfig:
     model_id: str = "Qwen/Qwen3-1.7B"
-    data: str = "artifacts/sft.jsonl"
+    data: str = "data/sft.jsonl"   # committed set; artifacts/ is gitignored
     out_dir: str = "artifacts/sft-run"
     max_len: int = 4096
     epochs: float = 2.0

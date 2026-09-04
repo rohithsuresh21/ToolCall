@@ -45,7 +45,8 @@ wait_for_pull() {
 
 # --------------------------------------------------------------------------- #
 if [[ "$STAGE" == "sft" ]]; then
-  echo "===== [SFT] 1.5k examples -> artifacts/sft-1p7b-fixed ====="
+  # 20_sft.sh audits data/sft.jsonl and refuses to start on DEFECTS PRESENT.
+  echo "===== [SFT] data/sft.jsonl (audited) -> artifacts/sft-1p7b-fixed ====="
   OUT="$REPO/artifacts/sft-1p7b-fixed" MODEL="${MODEL:-Qwen/Qwen3-1.7B}" \
     bash scripts/20_sft.sh
   wait_for_pull "$SHIP/sft-1p7b-fixed_*.tar.gz" "SFT adapter"
@@ -74,15 +75,15 @@ fi
 if [[ "$STAGE" == "judge" ]]; then
   echo "===== [JUDGE] benchmark eval -> report ====="
   [[ -d "$REPO/artifacts/grpo-planb-step3" ]] || { echo "FATAL: no GRPO adapter"; exit 1; }
-  if [[ ! -f "$REPO/artifacts/judge_tasks.jsonl" ]]; then
-    echo "FATAL: $REPO/artifacts/judge_tasks.jsonl not found. Push it from local first:"
-    echo "  powershell -File scripts/push_judge_tasks.ps1"
-    exit 1
+  # Reproducible from the hub -- no laptop-only parquet, no push step.
+  if [[ ! -f "$REPO/data/judge_tasks.jsonl" ]]; then
+    echo "judge task set missing; building it from the HF dataset..."
+    python3 "$REPO/scripts/make_judge_tasks.py" --out "$REPO/data/judge_tasks.jsonl"
   fi
   python3 "$REPO/scripts/judge_eval.py" \
     --base "${MODEL:-Qwen/Qwen3-1.7B}" \
     --adapter "$REPO/artifacts/grpo-planb-step3" \
-    --tasks "$REPO/artifacts/judge_tasks.jsonl" \
+    --tasks "$REPO/data/judge_tasks.jsonl" \
     --out "$REPO/artifacts/judge_eval_grpo-planb"
   tar -czf "$SHIP/judge-eval-grpo-planb_$STAMP.tar.gz" "$REPO/artifacts/judge_eval_grpo-planb"
   wait_for_pull "$SHIP/judge-eval-grpo-planb_*.tar.gz" "judge benchmark eval report"

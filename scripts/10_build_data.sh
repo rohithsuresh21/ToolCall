@@ -22,7 +22,29 @@ if [ "$TEACHER" != "oracle" ]; then
 fi
 
 # 3. filter + export.  --strict-format only once round 1 has taught the format.
-python3 -m atr.cli build artifacts/raw_*.jsonl --rebalance \
-    --max-per-task 1 --out artifacts/sft.jsonl
+#    Build to a CANDIDATE path and promote to the committed data/sft.jsonl only
+#    after the audit passes. Writing straight to the training path is how a leaky
+#    build became a training set: artifacts/ is gitignored, so nothing showed up
+#    in `git status` and no one re-audited before the GPU run.
+CANDIDATE="${CANDIDATE:-artifacts/sft_candidate.jsonl}"
+FINAL="${FINAL:-data/sft.jsonl}"
 
-wc -l artifacts/sft.jsonl
+python3 -m atr.cli build artifacts/raw_*.jsonl --rebalance \
+    --max-per-task 1 --out "$CANDIDATE"
+
+echo ""
+echo "=== auditing candidate build before promoting to $FINAL ==="
+if ! python3 tests/audit_sft.py "$CANDIDATE"; then
+  echo "" >&2
+  echo "REFUSING TO PROMOTE: $CANDIDATE reports DEFECTS PRESENT." >&2
+  echo "  The candidate is left in place for inspection; $FINAL is untouched." >&2
+  echo "  Check that the generator is at bd590a5 or later (terminal read +" >&2
+  echo "  prefix-leak filter) before rebuilding." >&2
+  exit 1
+fi
+
+mv -f "$CANDIDATE" "$FINAL"
+echo ""
+echo "promoted -> $FINAL ($(wc -l < "$FINAL") records)"
+echo "COMMIT IT: git add $FINAL && git commit -m 'Rebuild SFT set'"
+echo "  (the training scripts read the committed file, not artifacts/)"

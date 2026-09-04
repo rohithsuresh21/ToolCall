@@ -754,7 +754,7 @@ class GRPOTrainer:
         from ..eval.harness import aggregate, evaluate, load_eval_config
         ecfg = load_eval_config()
         tasks = dev_set(n_per_type=self.cfg.eval_per_type)
-        sp = SamplingParams(temperature=ecfg["temperature"],
+        sp = SamplingParams(temperature=ecfg["temperature"], top_p=ecfg["top_p"],
                             max_tokens=ecfg["max_new_tokens"])
         loop_cfg = LoopConfig(max_steps=ecfg["max_steps"],
                               repeat_guard=ecfg["repeat_guard"])

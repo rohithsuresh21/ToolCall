@@ -1,0 +1,13 @@
+# Line endings are load-bearing for two file types here.
+#
+# *.sh   run on the Linux GPU box. A CRLF checkout on Windows that gets pushed
+#        back gives `\r` at the end of every command and `bad interpreter` on the
+#        remote, which is a confusing failure a long way from its cause.
+#
+# *.jsonl are data whose bytes are compared. scripts/make_judge_tasks.py writes LF
+#        and prints a sha256 as the fingerprint of the judge task set; with
+#        core.autocrlf=true a Windows checkout would hold CRLF, so the file on
+#        disk would not match the digest the builder reports and re-running it
+#        would show a spurious diff.
+*.sh    text eol=lf
+*.jsonl text eol=lf

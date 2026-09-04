@@ -73,6 +73,7 @@ def eval_dev(model_id: str = "Qwen/Qwen3-1.7B", adapter: str | None = None,
                             cfg=LoopConfig(max_steps=ecfg["max_steps"],
                                            repeat_guard=ecfg["repeat_guard"]),
                             sp=SamplingParams(temperature=ecfg["temperature"],
+                                              top_p=ecfg["top_p"],
                                               max_tokens=ecfg["max_new_tokens"]))
     rep = aggregate(cards)
     print(format_report(rep, f"{model_id} + {adapter or 'base'}"))

@@ -24,6 +24,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 
@@ -180,18 +181,67 @@ class HFBackend(Backend):
         return outs
 
 
+# vLLM only accepts a max_lora_rank from this set, and it must be >= the adapter's
+# own r. Anything else raises at engine construction.
+_VLLM_LORA_RANKS = (8, 16, 32, 64, 128, 256)
+
+
+def lora_rank_of(adapter: str | None) -> int | None:
+    """The `r` a PEFT adapter was trained with, or None if it cannot be read.
+
+    Read rather than hardcoded so a rank change does not silently reintroduce the
+    failure this exists to prevent: vLLM's max_lora_rank defaults to 16 while
+    `SFTConfig.lora_r` is 32 (and the 4B script trains r=64), so serving any of
+    our adapters under the default blows up at engine construction. Hardcoding 32
+    would fix today and break the next time someone edits --lora-r.
+    """
+    if not adapter:
+        return None
+    cfg = Path(adapter) / "adapter_config.json"
+    if not cfg.is_file():
+        return None                      # hub id, or a merged (non-PEFT) checkpoint
+    try:
+        r = json.loads(cfg.read_text(encoding="utf-8")).get("r")
+        return int(r) if r else None
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _max_lora_rank_for(adapter: str | None, default: int = 16) -> int:
+    """Smallest vLLM-supported bucket that fits the adapter."""
+    r = lora_rank_of(adapter)
+    if r is None:
+        return default
+    for bucket in _VLLM_LORA_RANKS:
+        if bucket >= r:
+            return bucket
+    raise ValueError(f"adapter rank r={r} exceeds vLLM's largest supported "
+                     f"max_lora_rank ({_VLLM_LORA_RANKS[-1]})")
+
+
 # ---------------------------------------------------------------------------
 class VLLMBackend(Backend):
     name = "vllm"
 
     def __init__(self, model_id: str, adapter: str | None = None, enable_thinking: bool = False,
                  gpu_memory_utilization: float = 0.85, max_model_len: int = 8192,
-                 use_chatml: bool = True, **kw):
+                 use_chatml: bool = True, max_lora_rank: int | None = None, **kw):
         from transformers import AutoTokenizer
         from vllm import LLM
         self.tok = AutoTokenizer.from_pretrained(model_id)
+        lora_kw = {}
+        if adapter:
+            rank = max_lora_rank if max_lora_rank is not None else _max_lora_rank_for(adapter)
+            lora_kw["max_lora_rank"] = rank
+            detected = lora_rank_of(adapter)
+            print(f"[vllm] adapter {adapter}: r={detected if detected is not None else '?'} "
+                  f"-> max_lora_rank={rank}"
+                  + ("" if detected is not None else
+                     "  (adapter_config.json unreadable; using the default -- pass "
+                     "max_lora_rank= explicitly if the adapter is r>16)"))
         self.llm = LLM(model=model_id, gpu_memory_utilization=gpu_memory_utilization,
-                       max_model_len=max_model_len, enable_lora=bool(adapter), **kw)
+                       max_model_len=max_model_len, enable_lora=bool(adapter),
+                       **lora_kw, **kw)
         self.adapter = adapter
         self.enable_thinking = enable_thinking
         self.use_chatml = use_chatml

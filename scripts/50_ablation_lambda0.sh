@@ -72,7 +72,7 @@ run_arm () {
     python3 -m atr.cli eval \
       --backend "hf:$MODEL" --adapter "$OUT/final" \
       --temperature "$TEMP" --max-new-tokens 512 \
-      --tasks artifacts/judge_tasks.jsonl \
+      --tasks data/judge_tasks.jsonl \
       --out "artifacts/eval-ablation-$ARM_ID-judge-t$suffix"
   done
 }
