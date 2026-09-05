@@ -12,7 +12,7 @@
 
 $Host_ = "gpu17@10.214.5.55"
 $Port = 22013
-$Base = "~/ToolCall/atr/artifacts"
+$Base = "~/ToolCall/artifacts"
 $Dest = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "pulled 2"
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 
