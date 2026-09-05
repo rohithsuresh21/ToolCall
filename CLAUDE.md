@@ -29,6 +29,7 @@ python tests/test_fix2.py              # FIX-2 invariants incl. dead-code assert
 python tests/test_answer_f1.py         # token-F1 judge metric + reward/verifier wiring
 python tests/test_shortcut_filter.py   # shortcut + prefix-leak filters, train/dev route holdout
 python tests/test_naturalize.py        # naturalization with a mock LLM (offline)
+python tests/test_grpo_resume.py       # GRPO checkpoint/resume/wall-clock stop (CPU, no model)
 python tests/audit_sft.py data/sft.jsonl  # built-set audit: psychic queries, unretrieved/early answers, label conflicts
 python tests/verify_dataset.py         # needs artifacts/naturalized_passages_scaled.json
 python tests/verify_naturalize_live.py # needs artifacts/naturalized_passages.json
@@ -45,6 +46,10 @@ python scripts/make_judge_tasks.py            # -> data/judge_tasks.jsonl
 
 # GPU stages (bash scripts; env vars MODEL/ADAPTER/OUT override defaults)
 scripts/20_sft.sh   scripts/30_grpo.sh   scripts/40_eval.sh   scripts/60_merge_export.sh
+
+# GRPO inside a fixed reservation: stop cleanly at 3h30m, then continue next session
+MAX_SECONDS=12600 bash scripts/30_grpo.sh
+RESUME=artifacts/grpo-1p7b/final MAX_SECONDS=12600 bash scripts/30_grpo.sh
 ```
 
 Tests exit non-zero on failure and print `PASS`/`FAIL` per check. `test_pipeline.py`,
@@ -63,8 +68,10 @@ appears; booleans parse as the literal strings `true`/`false`.
 function of the seed and builds an encyclopedic entity graph with Wikipedia-style passages.
 `atr/tasks/generator.py` reads *the same world the tool reads*, so every task carries a
 computed `gold` plus an `oracle_plan` (the reference `search` sequence). Nothing is
-hand-labelled and nothing is frozen. **Train seeds `0..500k`, dev seeds `900k+`** — keep those
-ranges disjoint or gold answers leak. `generate()` draws from the train route pool and
+hand-labelled and nothing is frozen. **SFT-build seeds `0..500k`, dev seeds `900k+`, GRPO
+rollout seeds `1M..1.4M`** (`GRPOConfig.seed_start`/`seed_span`) — keep all three disjoint or
+gold answers leak. Note `test_pipeline.py` only checks the SFT-build range against dev; the
+GRPO range is disjoint by construction and nothing asserts it. `generate()` draws from the train route pool and
 `dev_set()` from the dev pool, so held-out route *shapes* also never appear in training.
 
 **The oracle is the harness's own unit test — for the VERIFIERS only.** `oracle_backend`
@@ -147,7 +154,10 @@ batched `generate()` per turn, because GRPO needs G rollouts per task per step.
 `tokenizer.apply_chat_template` — Qwen3's template strips `<think>` blocks from *previous*
 assistant turns, silently desynchronising multi-turn training from multi-turn inference.
 `assistant_spans()` is the masking contract: loss covers assistant content plus its
-`<|im_end|>` only. Training on tool results teaches the model to hallucinate
+`<|im_end|>` and the newline `render()` writes after it — nothing else. (That trailing newline
+is inert at inference: generation stops on `<|im_end|>`.) Verified over all 1951 records of
+`data/sft.jsonl` with the real Qwen3 tokenizer: 0 prefix-stability violations and the
+`min(e, len(full_ids))` clamp never fires. Training on tool results teaches the model to hallucinate
 `<tool_response>` blocks instead of calling the tool — that looks fine on the loss curve and
 scores zero on executable tasks.
 
@@ -216,14 +226,37 @@ tool calls -- so F1 is the score and there is no second axis worth trading it ag
 `dev_success` and `dev_necessity` are still logged by the canary as **diagnostics** -- read them
 when reading a run, never feed them into a decision.
 
-Note the canary's dev set is balanced across all five families while the judge's is hop-only, so
-`dev_f1` from the in-run canary is a consistent internal proxy for ranking checkpoints against
-each other, not the judge's number. `test_answer_f1.py` pins that mismatch so it stays visible.
+The canary's dev set is balanced across the ACTIVE families, and since `active_families()` is
+now the judge's 2/3/4-hop only, the canary mix IS the judge's mix -- `test_answer_f1.py` pins
+that (all canary tasks are hop families). It is still not the judge's NUMBER: the canary draws
+synthetic dev worlds, not the public MuSiQue rows, and `eval_per_type` is 3, so `dev_f1` is a
+consistent internal proxy for ranking checkpoints against each other. (This paragraph used to
+say the canary was balanced across all five families; that was true before `dev_set()` started
+reading `active_families()`, and re-zeroing a family's weight would restore the mismatch.)
 
 **`target_mix` fails loudly on a starved family.** A family with a positive target share and
 zero kept trajectories used to drop out of the feasibility `min()` and let the mix renormalise
 silently -- asking for 40/30/30 and getting 57/43/0 looked like success. `filter_and_balance` now
 raises. Set a share to `0.0` to build without a family deliberately.
+
+**A GRPO checkpoint is the adapter PLUS `trainer_state.pt`, and nothing else is a
+resume point.** `save_pretrained` writes weights. Continuing from weights alone restarts
+AdamW with zero moments, re-draws the task seeds already trained on, resets the curriculum
+position (`_stage_mix` reads `len(self.history)`) and forgets which checkpoint was winning —
+none of which raises, and none of which appears in `history.jsonl`. So `_save_checkpoint`
+writes optimiser state, the step counter, `best`, the history rows, the python+torch RNG
+states and the dead-frac window alongside every `step-N/` and `final/`, and
+`--resume-from` on a directory without that file **refuses** rather than silently cold-starting
+(it points you at `--adapter`, which is the flag that legitimately starts fresh from weights).
+On resume the policy continues from the checkpoint while the KL reference still anchors on
+`--adapter`, the SFT policy: re-anchoring it on the resumed checkpoint would let drift compound
+across restarts, which is what FIX-1 removed. `--max-seconds` checks the clock BEFORE each step
+and stops one step short of the budget, because a step costs ~140s and the reservation does not
+care that we were mid-`optimise()`. `best/` stays weights-only on purpose — it is a selection
+artifact, not a resume point. On resume `history.jsonl` is rewritten from the checkpoint's own
+history: it is opened in append mode, so the aborted tail of the previous session would
+otherwise sit in the file as duplicate step numbers that every downstream reader mis-plots.
+`tests/test_grpo_resume.py` covers all of it on CPU with a stand-in model.
 
 **Filtering on `success` alone is the classic mistake.** `atr/data/rejection.py` also rejects
 call-bloat, repeats and over-represented shapes, while explicitly *protecting* trajectories

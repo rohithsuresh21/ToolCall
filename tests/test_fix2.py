@@ -174,8 +174,19 @@ from atr.tasks.generator import generate as _gen
 t2.sample_tasks = lambda n=None: _gen(n or 6, seed_start=500_000)
 pool, dinfo = t2.collect_batch()
 live_gids = {r["group"] for r in pool}
-check(len(live_gids) >= min(2, len(live_gids)) and all(r["live"] for r in pool),
+# `len(live_gids) >= min(2, len(live_gids))` was the old first conjunct: a
+# tautology (min(2, x) <= x for every x). With an empty pool the second conjunct
+# is a vacuous all(), so the whole check passed when dynamic sampling returned
+# NOTHING. Assert the pool is non-empty and that it reached the target instead.
+check(len(pool) > 0, f"dynamic sampling returned a non-empty pool ({len(pool)} records)")
+check(len(live_gids) >= cfg2.tasks_per_step,
+      f"dynamic sampling filled the target of {cfg2.tasks_per_step} live groups "
+      f"(got {len(live_gids)}, discarded={dinfo['discarded_groups']})")
+check(all(r["live"] for r in pool),
       f"dynamic sampling kept only live groups ({len(live_gids)}, discarded={dinfo['discarded_groups']})")
+check(dinfo["discarded_groups"] > 0,
+      f"the dead half really was discarded, so the filter is not a no-op "
+      f"(discarded={dinfo['discarded_groups']})")
 check(dinfo["gen_batches"] <= 3, "gen-batch cap respected")
 
 # ---------------------------------------------------------------- F10 frozen eval config

@@ -12,10 +12,19 @@
 # structurally blind here. tests/audit_sft.py is the only check that reads the
 # retrieved passages, and it exits non-zero on DEFECTS PRESENT.
 #
-# The gate therefore does two things, and both matter:
+# The gate therefore does three things, and all of them matter:
 #   1. refuses to start when the audit reports DEFECTS PRESENT;
 #   2. refuses when a gitignored artifacts/ copy could be shadowing the argument,
-#      because that is the specific mistake that cost us a training run.
+#      because that is the specific mistake that cost us a training run;
+#   3. refuses a set below MIN_SFT_RECORDS rows.
+#
+# (3) exists because the audit checks QUALITY and never QUANTITY, which is the
+# same silent-pass shape as everything else on this list. scripts/10_build_data.sh
+# defaults to N=40 seeds; run with those defaults it produces SEVENTEEN records,
+# audits CLEAN, and `mv -f`s them over the 1,951-record committed set. Nothing in
+# the pipeline notices: the gate says PASS, the oracle says 100%, the loss curve
+# looks normal, and the run is worthless. A floor is the only thing that can see
+# it, because "clean" is true of 17 records and of 1,951 alike.
 
 # Resolve a working interpreter. `python3` is the right name on the GPU box but on
 # Windows it is often the Microsoft Store stub, which prints "Python was not found"
@@ -34,9 +43,14 @@ _gate_python() {
   return 1
 }
 
+# Minimum rows a training set must have. 500 is well under the committed 1,951 and
+# far above anything a mis-parameterised rebuild produces, so it catches the
+# accident without vetoing a deliberately smaller experiment (override to run one).
+MIN_SFT_RECORDS="${MIN_SFT_RECORDS:-500}"
+
 require_clean_dataset() {
   local data="$1"
-  local py rc
+  local py rc n
 
   if [[ -z "$data" ]]; then
     echo "FATAL: require_clean_dataset needs a dataset path." >&2
@@ -48,7 +62,29 @@ require_clean_dataset() {
     return 1
   fi
 
-  echo "=== data gate: auditing $data ($(wc -l < "$data") records) ==="
+  n="$(wc -l < "$data" | tr -d '[:space:]')"
+  echo "=== data gate: auditing $data ($n records) ==="
+
+  # Size floor. The audit below cannot catch this: 17 clean records are CLEAN.
+  if (( n < MIN_SFT_RECORDS )); then
+    echo "" >&2
+    echo "########################################################################" >&2
+    echo "  REFUSING TO TRAIN: $data has $n records, below the floor of" >&2
+    echo "  MIN_SFT_RECORDS=$MIN_SFT_RECORDS." >&2
+    echo "" >&2
+    echo "  A short set passes the audit -- 'clean' is a statement about the rows" >&2
+    echo "  that are there, not about how many. The usual cause is a rebuild at" >&2
+    echo "  the default seed count: scripts/10_build_data.sh defaults to N=40," >&2
+    echo "  which yields ~17 records and overwrites data/sft.jsonl. Rebuild with" >&2
+    echo "  the seed count the committed set was built from:" >&2
+    echo "    N=6000 bash scripts/10_build_data.sh" >&2
+    echo "  or restore the committed set:  git checkout -- $data" >&2
+    echo "" >&2
+    echo "  To train on a smaller set deliberately:" >&2
+    echo "    MIN_SFT_RECORDS=$n bash scripts/20_sft.sh" >&2
+    echo "########################################################################" >&2
+    return 1
+  fi
 
   # Shadowing check: warn loudly if the gitignored twin exists and differs.
   if [[ "$data" != "artifacts/sft.jsonl" && -f "artifacts/sft.jsonl" ]]; then
@@ -99,5 +135,5 @@ require_clean_dataset() {
     return 1
   fi
 
-  echo "=== data gate: PASS -- $data is clean, starting training ==="
+  echo "=== data gate: PASS -- $data is clean ($n records >= $MIN_SFT_RECORDS), starting training ==="
 }

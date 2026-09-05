@@ -102,7 +102,7 @@ def cmd_collect(args):
     tasks = _tasks_from(args)
     be = oracle_backend(tasks) if args.backend == "oracle" else _backend(args)
     recs = collect(tasks, be, env=args.env,
-                   cfg=LoopConfig(max_steps=fz["max_steps"],
+                   cfg=LoopConfig(max_steps=fz["max_steps"], repeat_guard=fz["repeat_guard"],
                                   text_loader=load_naturalized_loader(args.cache) if args.cache else None),
                    sp=SamplingParams(temperature=fz["temperature"], top_p=fz["top_p"],
                                      max_tokens=fz["max_new_tokens"]),
@@ -139,7 +139,7 @@ def cmd_ablate(args):
     """
     tasks = _tasks_from(args)
     fz = _frozen(args)
-    cfg = LoopConfig(max_steps=fz["max_steps"],
+    cfg = LoopConfig(max_steps=fz["max_steps"], repeat_guard=fz["repeat_guard"],
                      text_loader=load_naturalized_loader(args.cache) if args.cache else None)
     rows = []
 

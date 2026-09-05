@@ -57,7 +57,14 @@ def check_task(task: Task, env: str = "builtin", text_loader=None) -> dict:
     hit_last = False
     for i, step in enumerate(calls, start=1):
         res = registry.call(world, step["name"], dict(step.get("arguments", {})))
-        found = any(want in norm_text(h.get("text", ""))
+        # title AND text -- the same pair `_is_prefix_leaky` and
+        # `_is_shortcut_solvable` read, and the same pair audit_sft._hit_texts
+        # parses. Text alone under-reports `first_hit_call` whenever the gold
+        # answer IS an entity name: it leaks through the TITLE of a co-retrieved
+        # passage while that passage's prose never spells it out. Never the raw
+        # tool_response string -- norm_text deletes punctuation, so gold "1949"
+        # would substring-match the BM25 `"score": 5.1949`.
+        found = any(want in norm_text(f"{h.get('title', '')} {h.get('text', '')}")
                     for h in res.get("results", []) or [])
         if found and first_hit is None:
             first_hit = i

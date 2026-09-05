@@ -171,6 +171,20 @@ class GRPOConfig:
     eval_every: int = 50                  # >0 runs the held-out dev canary every N steps
     eval_per_type: int = 3                # dev tasks per family when the canary runs
 
+    # --- durability -----------------------------------------------------------
+    # A fixed GPU reservation must never cost more than `save_every` steps. Every
+    # checkpoint this trainer writes carries `trainer_state.pt` NEXT TO the adapter:
+    # optimiser moments, the step counter, `best`, the history rows, the RNG states
+    # and the dead-frac window. `save_pretrained` on its own writes WEIGHTS ONLY, so
+    # a run "resumed" from a weights-only directory restarts AdamW cold and re-draws
+    # the task seeds it already trained on -- neither shows up in the logs, and both
+    # look like a healthy run that simply learns worse.
+    resume_from: str | None = None        # checkpoint dir written by this trainer
+                                          # (must contain trainer_state.pt)
+    max_seconds: int = 0                  # 0 = no limit. Otherwise stop cleanly and
+                                          # save once THIS session's wall clock would
+                                          # not fit another step. 3h30m = 12600.
+
 
 # ---------------------------------------------------------------------------
 class _PolicyBackend(Backend):
@@ -283,9 +297,14 @@ class GRPOTrainer:
 
         self.model = AutoModelForCausalLM.from_pretrained(
             cfg.model_id, torch_dtype=torch.bfloat16, attn_implementation="sdpa")
-        if cfg.adapter:
+        # On resume the POLICY continues from the checkpoint's adapter. The KL
+        # reference built below still anchors on cfg.adapter (the SFT policy):
+        # re-anchoring it on the resumed checkpoint would let drift compound across
+        # restarts, which is exactly what FIX-1 removed.
+        policy_adapter = cfg.resume_from or cfg.adapter
+        if policy_adapter:
             from peft import PeftModel
-            self.model = PeftModel.from_pretrained(self.model, cfg.adapter, is_trainable=True)
+            self.model = PeftModel.from_pretrained(self.model, policy_adapter, is_trainable=True)
         elif cfg.lora:
             from peft import LoraConfig, get_peft_model
             self.model = get_peft_model(self.model, LoraConfig(
@@ -321,6 +340,75 @@ class GRPOTrainer:
         # maintained in train(), capped at dead_group_window entries
         self.dead_frac_window: list[float] = []
         self._last_group_stats: list[dict] = []
+        self.start_step = 0                    # last COMPLETED step; 0 = fresh run
+        if cfg.resume_from:
+            self._restore_trainer_state(cfg.resume_from)
+
+    # -- 0. durability ---------------------------------------------------
+    def _save_checkpoint(self, path: Path, step: int) -> None:
+        """Adapter + tokenizer + everything needed to CONTINUE from here.
+
+        Weights alone are not a resume point. Without the optimiser moments AdamW
+        restarts cold; without the RNG states the next session re-draws the task
+        seeds it already trained on; without `best`/`history` the run forgets which
+        checkpoint was winning. None of those raise, and none of them show up in
+        history.jsonl -- they just quietly make the resumed run worse than the one
+        that was interrupted."""
+        import torch
+        path.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(path)
+        self.tok.save_pretrained(path)
+        state = {
+            "format": 1,
+            "step": step,
+            "optimizer": self.opt.state_dict(),
+            "best": self.best,
+            "history": self.history,
+            "rng_python": self.rng.getstate(),
+            "rng_torch": torch.get_rng_state(),
+            "dead_frac_window": list(self.dead_frac_window),
+            "cfg": asdict(self.cfg),
+        }
+        if torch.cuda.is_available():
+            state["rng_cuda"] = torch.cuda.get_rng_state_all()
+        torch.save(state, path / "trainer_state.pt")
+
+    def _restore_trainer_state(self, path: str) -> None:
+        """Load optimiser/step/best/history/RNG saved by `_save_checkpoint`.
+
+        Refuses a weights-only directory rather than starting cold from it: a silent
+        cold restart is the failure this whole mechanism exists to prevent, so it
+        must not be reachable by pointing --resume-from at the wrong folder."""
+        import torch
+        st_path = Path(path) / "trainer_state.pt"
+        if not st_path.is_file():
+            raise FileNotFoundError("\n".join([
+                f"--resume-from {path} contains no trainer_state.pt.",
+                "  That directory holds WEIGHTS only -- an adapter from "
+                "save_pretrained, or a checkpoint written before this trainer "
+                "saved optimiser state.",
+                "  Resuming from it would restart AdamW cold and re-draw seeds "
+                "already trained on, silently.",
+                f"  To start a FRESH run from those weights instead: --adapter {path}",
+            ]))
+        # weights_only=True is the torch>=2.6 default and cannot load the optimiser
+        # moments, the RNG tuples or the history rows in this file.
+        st = torch.load(st_path, map_location="cpu", weights_only=False)
+        self.opt.load_state_dict(st["optimizer"])
+        self.start_step = int(st["step"])
+        self.best = st.get("best")
+        self.history = list(st.get("history") or [])
+        self.dead_frac_window = list(st.get("dead_frac_window") or [])
+        if st.get("rng_python") is not None:
+            self.rng.setstate(st["rng_python"])
+        if st.get("rng_torch") is not None:
+            torch.set_rng_state(st["rng_torch"].cpu().to(torch.uint8))
+        cuda_state = st.get("rng_cuda")
+        if cuda_state is not None and torch.cuda.is_available()                 and len(cuda_state) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cuda_state)
+        print(f"[grpo] resumed from {path}: step {self.start_step}, "
+              f"{len(self.history)} history rows, "
+              f"best={self.best['dev_f1'] if self.best else None}", flush=True)
 
     # -- 1. sample -------------------------------------------------------
     # Difficulty here is CHAIN LENGTH -- the only axis left once the eval is
@@ -747,10 +835,12 @@ class GRPOTrainer:
         dev_f1 is the only number selection reads (see canary_accept). dev_success
         and dev_necessity come back alongside it as DIAGNOSTICS -- they are worth
         having in history.jsonl when reading a run, and they are not inputs to any
-        decision. Note the dev set is balanced across all five families while the
-        official eval is 2/3/4-hop only, so dev_f1 here is not the judge's number;
-        it is a consistent internal proxy for ranking checkpoints against each
-        other. The final-selection pass is where the mix should match the judge."""
+        decision. dev_set() draws from active_families(), which is the judge's
+        2/3/4-hop set, so the canary MIX matches the judge -- it is still not the
+        judge's NUMBER (synthetic dev worlds, eval_per_type=3), just a consistent
+        internal proxy for ranking checkpoints against each other. The docstring
+        used to claim five families here; that predates dev_set() reading
+        active_families()."""
         from ..eval.harness import aggregate, evaluate, load_eval_config
         ecfg = load_eval_config()
         tasks = dev_set(n_per_type=self.cfg.eval_per_type)
@@ -770,7 +860,43 @@ class GRPOTrainer:
         out.mkdir(parents=True, exist_ok=True)
         (out / "config.json").write_text(json.dumps(asdict(self.cfg), indent=2, default=str))
 
-        for step in range(1, self.cfg.steps + 1):
+        # history.jsonl is opened in append mode below, and a resumed run re-enters
+        # the loop at start_step+1. Any rows already in the file for steps ABOVE
+        # start_step are the aborted tail of the previous session -- left in place
+        # they produce interleaved duplicate step numbers that every downstream
+        # reader silently mis-plots. The checkpoint's own history IS the run up to
+        # start_step, so rewrite the file from it.
+        hist_path = out / "history.jsonl"
+        if self.start_step:
+            with hist_path.open("w") as f:
+                for row in self.history:
+                    f.write(json.dumps(row) + "\n")
+            print(f"[grpo] history.jsonl rewritten to {len(self.history)} rows "
+                  f"(steps 1..{self.start_step}); the aborted tail is dropped",
+                  flush=True)
+
+        t_session = time.time()
+        budget = max(0, int(self.cfg.max_seconds))
+        step_secs: list[float] = []
+        last_done = self.start_step
+        stopped_early = False
+        if budget:
+            print(f"[grpo] wall-clock budget {budget}s for this session", flush=True)
+
+        for step in range(self.start_step + 1, self.cfg.steps + 1):
+            # Check the budget BEFORE starting a step, not after. A step costs on the
+            # order of a hundred seconds and the reservation does not care that we
+            # were mid-optimise: stopping one step short and saving beats being
+            # killed with that step's work AND the optimiser state unwritten.
+            if budget:
+                elapsed = time.time() - t_session
+                projected = max(step_secs[-3:], default=0.0)
+                if elapsed + projected >= budget:
+                    print(f"[grpo] wall-clock stop before step {step}: "
+                          f"{elapsed:.0f}s elapsed + ~{projected:.1f}s for the next "
+                          f"step >= budget {budget}s", flush=True)
+                    stopped_early = True
+                    break
             t0 = time.time()
             records, dinfo = self.collect_batch()
             ginfo = self.assign_advantages(records)     # idempotent; refresh stats
@@ -850,17 +976,24 @@ class GRPOTrainer:
                 f.write(json.dumps(row) + "\n")
 
             if self.cfg.save_every and step % self.cfg.save_every == 0:
-                self.model.save_pretrained(out / f"step-{step}")
-                self.tok.save_pretrained(out / f"step-{step}")
+                self._save_checkpoint(out / f"step-{step}", step)
 
-        self.model.save_pretrained(out / "final")
-        self.tok.save_pretrained(out / "final")
+            last_done = step
+            step_secs.append(time.time() - t0)
+
+        # `final` is a full resume point too, so a wall-clock stop loses nothing.
+        self._save_checkpoint(out / "final", last_done)
+        head = (f"[grpo] STOPPED EARLY at step {last_done}/{self.cfg.steps} on the "
+                f"{budget}s wall-clock budget" if stopped_early
+                else f"[grpo] done at step {last_done}/{self.cfg.steps}")
+        print(f"{head} -> {out / 'final'}")
+        if stopped_early:
+            print("[grpo] continue the run with:")
+            print(f"         --resume-from {out / 'final'} --out-dir {out}")
         if self.best is not None:
-            print(f"[grpo] done -> {out / 'final'}  (best canary dev_f1 "
-                  f"{self.best['dev_f1']:.3f} at dev_success {self.best['dev_success']:.3f}, "
-                  f"step {self.best['step']} -> {out / 'best'})")
-        else:
-            print(f"[grpo] done -> {out / 'final'}")
+            print(f"[grpo] best canary dev_f1 {self.best['dev_f1']:.3f} at "
+                  f"dev_success {self.best['dev_success']:.3f}, "
+                  f"step {self.best['step']} -> {out / 'best'}")
 
 
 def cli():

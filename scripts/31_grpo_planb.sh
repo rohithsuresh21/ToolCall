@@ -23,6 +23,11 @@ STAGE="${STAGE:-step3}"
 # ensures exactly ONE end-of-run canary (-> best) and a saved final adapter.
 STEPS="${STEPS:-300}"
 EVAL_EVERY="${EVAL_EVERY:-50}"
+# Wall-clock budget for THIS session (default 3h30m of a 4h reservation), and the
+# resume hook. See 30_grpo.sh. With these you no longer have to guess STEPS to fit
+# the window: set STEPS high, let MAX_SECONDS end the session, and continue with
+#   RESUME=$OUT/final bash scripts/31_grpo_planb.sh
+MAX_SECONDS="${MAX_SECONDS:-12600}"
 
 # Plan B knobs (environment-overridable, tunable for the no-degradation guard).
 # DQW temperature on the REWARD scale: 2.2 -> hard ~1.6x weight, easy kept ~0.78x.
@@ -52,6 +57,8 @@ python3 -m atr.train.grpo \
   --lr 2e-5 --temperature 1.0 --kl-beta 0.03 --micro-batch 2 \
   --curriculum true --void-turn-filter true --eval-every "$EVAL_EVERY" \
   --log-every 5 \
+  --max-seconds "$MAX_SECONDS" \
+  ${RESUME:+--resume-from "$RESUME"} \
   $PB
 
 # ---- TRAIN-DONE: archive + advertise for local sync (never skip!) ----
