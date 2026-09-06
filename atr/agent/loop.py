@@ -81,7 +81,13 @@ class _Episode:
         self.task = task
         self.cfg = cfg
         self.registry = registry
-        self.world: World = build_world(task.seed, text_loader=cfg.text_loader)
+        if getattr(task, "documents", None):
+            # Real-task override (MuSiQue train rollouts): the task carries its own
+            # 20-passage candidate set, so the seeded synthetic world is replaced.
+            self.world: World = World(seed=getattr(task, "seed", 0))
+            self.world.documents = list(task.documents)
+        else:
+            self.world: World = build_world(task.seed, text_loader=cfg.text_loader)
         self.messages = build_messages(task.prompt, registry, cfg.prompt_mode)
         self.traj = Trajectory(task_id=task.task_id, prompt=task.prompt, seed=task.seed,
                                meta={"task_type": task.task_type, "difficulty": task.difficulty})

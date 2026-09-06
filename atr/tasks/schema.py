@@ -44,6 +44,11 @@ class Task:
                                                               # families with no chain.
     expect_side_effect: dict | None = None                    # e.g. {"to": ..., "must_contain": [...]}
     notes: str = ""
+    # Optional explicit 20-passage candidate set (real MuSiQue train tasks).
+    # When non-empty this REPLACES the seeded synthetic world for the episode:
+    # the task owns its documents instead of deriving them from build_world(seed).
+    # Shape mirrors the judge probe: [{"doc_id", "title", "text", "facts", "links"}].
+    documents: list[dict] = field(default_factory=list)
 
     @property
     def needs_tool(self) -> bool:

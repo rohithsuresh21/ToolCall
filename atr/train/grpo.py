@@ -119,6 +119,13 @@ class GRPOConfig:
     # --- curriculum ---
     task_mix: dict = field(default_factory=lambda: dict(DEFAULT_MIX))
     curriculum: bool = True               # stage difficulty easy -> default -> hard
+    # Real-task mixing (4-hop fix): draw part of each step's tasks from a real
+    # MuSiQue-Ans train pool (data/musique_train_tasks.jsonl, built by
+    # scripts/make_musique_train_tasks.py and double-checked disjoint from the
+    # 54-example judge probe) instead of minting everything synthetically.
+    # The empty default keeps every existing run bit-identical.
+    real_tasks_path: str = ""
+    real_fraction: float = 0.2            # share of live tasks from the real pool
     # curriculum_feedback closes the loop from the (already-computed) dead-group
     # diagnostic back into sampling: when the rolling frac_dead_groups exceeds
     # dead_group_threshold, _stage_mix pulls the curriculum position f back
@@ -290,6 +297,7 @@ class GRPOTrainer:
 
         self.cfg = cfg
         self.rng = random.Random(cfg.seed)
+        self._real_pool_cache: dict[str, list[Task]] = {}
         self.registry = get_registry(cfg.env)
         self.tok = AutoTokenizer.from_pretrained(cfg.model_id)
         if self.tok.pad_token is None:
@@ -506,13 +514,48 @@ class GRPOTrainer:
         t = min(1.0, (f - 0.70) / 0.15)
         return self._lerp_mix(self.cfg.task_mix, self.CURRICULUM_HARD, t)
 
+    def _real_pool(self) -> list[Task]:
+        """Lazy-load the real MuSiQue train task pool (id-cache on the trainer)."""
+        if not self.cfg.real_tasks_path:
+            return []
+        key = self.cfg.real_tasks_path
+        pool = self._real_pool_cache.get(key)
+        if pool is None:
+            path = Path(key)
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"real_tasks_path {path} not found; build it with "
+                    f"scripts/make_musique_train_tasks.py")
+            pool = []
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    pool.append(Task.from_dict(json.loads(line)))
+            if not pool:
+                raise ValueError(f"real task pool {path} is empty")
+            print(f"[grpo] loaded real task pool: {len(pool)} tasks from {path}",
+                  flush=True)
+            self._real_pool_cache[key] = pool
+        return pool
+
     def sample_tasks(self, n: int | None = None) -> list[Task]:
         n = n or self.cfg.tasks_per_step
         base = self.rng.randrange(self.cfg.seed_start,
                                   self.cfg.seed_start + self.cfg.seed_span)
         mix = self._stage_mix(len(self.history) + 1) if self.cfg.curriculum else self.cfg.task_mix
-        return generate(n, seed_start=base, mix=mix,
-                        rng_seed=self.rng.randrange(1 << 30))
+        tasks = generate(n, seed_start=base, mix=mix,
+                         rng_seed=self.rng.randrange(1 << 30))
+        real = self._real_pool()
+        if real:
+            k = int(round(n * self.cfg.real_fraction))
+            k = max(0, min(k, n, len(real)))
+            if k:
+                idx = self.rng.sample(range(len(real)), k)
+                tasks = [real[i] for i in idx] + tasks[: n - k]
+                self.rng.shuffle(tasks)
+        return tasks
 
     # -- 1b. rollout -----------------------------------------------------
     def rollout(self, tasks: Sequence[Task]) -> list[dict]:
