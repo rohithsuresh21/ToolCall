@@ -52,7 +52,7 @@ from ..agent.backends import Backend, SamplingParams
 from ..agent.chatml import assistant_spans
 from ..agent.loop import LoopConfig, run_episodes
 from ..tasks.generator import DEFAULT_MIX, dev_set, generate
-from ..tasks.schema import Task
+from ..tasks.schema import Task, task_source
 from ..tasks.verifiers import score as score_traj
 from ..tools.adapter import get_registry
 from .reward import (RewardConfig, compute_reward, dqw_weights, group_advantages,
@@ -714,14 +714,33 @@ class GRPOTrainer:
                 r["live"] = r_live
                 r["dead_reason"] = reason
 
+            # Every episode in a group is a rollout of ONE task, so the group has
+            # exactly one source. Recorded per group because the live-group RATE
+            # PER SOURCE is what should set `real_fraction`: synthetic 2-hop is
+            # solved ~100% of the time, so its groups die on zero variance and
+            # contribute no gradient however many of them we draw, while real
+            # tasks sit near 46% and disagree with themselves -- which is the
+            # only condition under which a GRPO group teaches anything.
+            src = task_source(rs[0].get("task"))
+            for r in rs:
+                r["source"] = src
+
             # Diagnostic group stats for reading a run (not used by any decision).
             group_stats.append({"group": gid, "n": len(rs), "mean_reward": round(mean_rewards[gi], 4),
                                 "dqw_weight": round(w, 4), "live": bool(r_live),
-                                "dead_reason": reason})
+                                "dead_reason": reason, "source": src})
 
         self._last_group_stats = group_stats
+        by_source: dict[str, dict] = {}
+        for g in group_stats:
+            b = by_source.setdefault(g["source"], {"groups": 0, "live": 0})
+            b["groups"] += 1
+            b["live"] += int(bool(g["live"]))
+        for b in by_source.values():
+            b["live_rate"] = round(b["live"] / max(1, b["groups"]), 3)
         return {"n_groups": len(groups), "dead_groups": dead,
                 "frac_dead_groups": round(dead / max(1, len(groups)), 3),
+                "groups_by_source": {k: by_source[k] for k in sorted(by_source)},
                 "frac_void_episodes": round(
                     sum(r["void"] for r in records) / max(1, len(records)), 3)}
 
@@ -867,8 +886,18 @@ class GRPOTrainer:
         # threw away 72/72 groups is indistinguishable from a step where the
         # policy simply scored zero: both log the same all-zero row.
         reasons: dict[str, int] = {}
+        # Same accounting split by SOURCE. `real_fraction` is currently a guess
+        # (0.2, chosen before MuSiQue was permitted); the number that should set
+        # it is the share of each source's groups that actually come back LIVE,
+        # because a dead group costs a full rollout and contributes exactly zero
+        # gradient. One step of this tells you the trade directly.
+        src_stats: dict[str, dict] = {}
         sampled: list[dict] = []              # every episode rolled out this step
         n_episodes = 0
+
+        def _src_bucket(name: str) -> dict:
+            return src_stats.setdefault(name, {"sampled_groups": 0, "live_groups": 0,
+                                               "discarded_groups": 0, "reasons": {}})
         while gen_batches < max(1, self.cfg.max_gen_batches):
             n = target * (self.cfg.batch_multiplier if gen_batches == 0 else 2)
             tasks = self.sample_tasks(min(n, self.cfg.seed_span))
@@ -883,7 +912,13 @@ class GRPOTrainer:
             for gid in dict.fromkeys(r["group"] for r in records):
                 total_groups += 1                 # every sampled group counts here
                 grp = [r for r in records if r["group"] == gid]
+                # An all-void group never reaches assign_advantages, so it has no
+                # "source" stamped on it either -- read it off the task directly.
+                gsrc = grp[0].get("source") or task_source(grp[0].get("task"))
+                bucket = _src_bucket(gsrc)
+                bucket["sampled_groups"] += 1
                 if any(r.get("live") for r in grp):
+                    bucket["live_groups"] += 1
                     if gid not in seen:
                         fresh.append(grp)
                 else:
@@ -895,6 +930,8 @@ class GRPOTrainer:
                     if why is None:
                         why = "all_void" if all(r["void"] for r in grp) else "unknown"
                     reasons[why] = reasons.get(why, 0) + 1
+                    bucket["discarded_groups"] += 1
+                    bucket["reasons"][why] = bucket["reasons"].get(why, 0) + 1
             for grp in fresh:
                 if len(seen) >= target:
                     break
@@ -906,10 +943,15 @@ class GRPOTrainer:
         # Plan B Fix-3: TRUE dead fraction = discarded sampled groups / all sampled.
         # This is the signal that must feed curriculum_feedback, not the (near-zero)
         # fraction recomputed inside the already-filtered pool.
+        for b in src_stats.values():
+            b["live_rate"] = round(b["live_groups"] / max(1, b["sampled_groups"]), 3)
+            b["reasons"] = {k: b["reasons"][k] for k in sorted(b["reasons"])}
         info = {"gen_batches": gen_batches, "discarded_groups": discarded,
                 "live_groups": len(seen), "sampled_groups": total_groups,
                 "rollout_episodes": n_episodes,
-                "discard_reasons": {k: reasons[k] for k in sorted(reasons)}}
+                "discard_reasons": {k: reasons[k] for k in sorted(reasons)},
+                # live_rate per source: the number that should set real_fraction.
+                "by_source": {k: src_stats[k] for k in sorted(src_stats)}}
         if self.cfg.log_sampled_stats:
             info.update(self._sampled_stats(sampled))
         return pool, info
@@ -942,6 +984,14 @@ class GRPOTrainer:
             "smp_truncated_frac": round(
                 sum(bool(r["card"].detail.get("truncated")) for r in sampled) / n, 4),
             "smp_stop_reasons": {k: stop[k] for k in sorted(stop)},
+            # F1 split by source. Synthetic sits at ~1.0 (which is exactly why its
+            # groups carry no variance); real is the number that tracks the judge.
+            "smp_f1_by_source": {
+                src: round(statistics.fmean(
+                    [r["card"].final_f1 for r in sampled
+                     if task_source(r.get("task")) == src]), 4)
+                for src in sorted({task_source(r.get("task")) for r in sampled})
+            },
         }
 
     def _dump_rollouts(self, records: list[dict], step: int) -> None:
@@ -1145,6 +1195,9 @@ class GRPOTrainer:
                 "grp_mean_rewards": [g["mean_reward"] for g in gstats],
                 "grp_dqw": [g["dqw_weight"] for g in gstats],
                 "dead_group_rolling_mean": round(dg_mean, 4),
+                # Per-source group accounting: sampled/live/discarded + live_rate
+                # for "synthetic" and "real". Read live_rate to set real_fraction.
+                "by_source": dinfo.get("by_source", {}),
                 "curriculum_pulled_back": bool(pulled_back),
                 # True when every quality field above is a mean over an empty
                 # pool. The smp_* fields carry the real policy numbers.

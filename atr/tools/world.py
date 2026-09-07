@@ -313,6 +313,29 @@ def _founder_clause(a: dict, variant: int) -> str:
             f" {f} established it."][variant % 3]
 
 
+def world_for_task(task, text_loader=None) -> World:
+    """The World an episode should run in, for synthetic AND real tasks.
+
+    A real MuSiQue train task carries its own 20-passage candidate set on
+    `task.documents`; that set REPLACES the seeded synthetic world, because its
+    `seed` is a fingerprint of the source row rather than a world recipe and
+    `build_world(seed)` would happily return a full synthetic universe that has
+    nothing to do with the question.
+
+    This lives here, and every consumer calls it, because the rule was previously
+    inlined in `_Episode.__init__` alone. `retrievability.check_task` kept calling
+    `build_world(task.seed)` directly and so scored real tasks against a synthetic
+    corpus -- reporting 40/40 of them "unretrievable" at rate 1.0, a number that
+    looks like a data defect and is actually the wrong world. One shared helper is
+    what stops the two from drifting apart again.
+    """
+    if getattr(task, "documents", None):
+        w = World(seed=getattr(task, "seed", 0))
+        w.documents = list(task.documents)
+        return w
+    return build_world(task.seed, text_loader=text_loader)
+
+
 def _passage(e: dict, w: World) -> dict:
     """Render one Wikipedia-style passage (title + text) from an entity.
 

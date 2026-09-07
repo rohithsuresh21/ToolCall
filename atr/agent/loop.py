@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Sequence
 
 from ..tools.registry import ToolRegistry
-from ..tools.world import World, build_world
+from ..tools.world import World, build_world, world_for_task
 from .backends import Backend, SamplingParams
 from .parser import ParsedTurn, parse_turn
 from .prompt import build_messages
@@ -81,13 +81,10 @@ class _Episode:
         self.task = task
         self.cfg = cfg
         self.registry = registry
-        if getattr(task, "documents", None):
-            # Real-task override (MuSiQue train rollouts): the task carries its own
-            # 20-passage candidate set, so the seeded synthetic world is replaced.
-            self.world: World = World(seed=getattr(task, "seed", 0))
-            self.world.documents = list(task.documents)
-        else:
-            self.world: World = build_world(task.seed, text_loader=cfg.text_loader)
+        # Real-task override (MuSiQue train rollouts): a task carrying its own
+        # 20-passage candidate set replaces the seeded synthetic world. Shared with
+        # retrievability.check_task via world_for_task so the two cannot drift.
+        self.world: World = world_for_task(task, text_loader=cfg.text_loader)
         self.messages = build_messages(task.prompt, registry, cfg.prompt_mode)
         self.traj = Trajectory(task_id=task.task_id, prompt=task.prompt, seed=task.seed,
                                meta={"task_type": task.task_type, "difficulty": task.difficulty})

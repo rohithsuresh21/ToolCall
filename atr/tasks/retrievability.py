@@ -33,8 +33,8 @@ from collections import Counter
 from typing import Sequence
 
 from ..tools.adapter import get_registry
-from ..tools.world import build_world
-from .schema import Task, norm_text
+from ..tools.world import build_world, world_for_task
+from .schema import Task, norm_text, task_source
 
 
 def check_task(task: Task, env: str = "builtin", text_loader=None) -> dict:
@@ -47,11 +47,16 @@ def check_task(task: Task, env: str = "builtin", text_loader=None) -> dict:
     """
     want = norm_text(task.oracle_answer or "")
     calls = [s for s in task.oracle_plan if not s.get("__expect_error__")]
+    src = task_source(task)
     if not want or not calls or task.gold.get("kind") == "none":
-        return {"retrievable": True, "in_last_call": True,
+        return {"retrievable": True, "in_last_call": True, "source": src,
+                "answer_in_corpus": True, "plan_executable": True,
                 "first_hit_call": None, "num_calls": len(calls), "skipped": True}
 
-    world = build_world(task.seed, text_loader=text_loader)
+    # Real tasks own their corpus; synthetic tasks derive it from the seed. Going
+    # through build_world unconditionally searched a synthetic universe for a real
+    # answer and called every real task unretrievable.
+    world = world_for_task(task, text_loader=text_loader)
     registry = get_registry(env)
     first_hit = None
     hit_last = False
@@ -70,7 +75,23 @@ def check_task(task: Task, env: str = "builtin", text_loader=None) -> dict:
             first_hit = i
         if i == len(calls):
             hit_last = found
-    return {"retrievable": first_hit is not None, "in_last_call": hit_last,
+    # Is the answer in this task's corpus AT ALL, independent of whether the plan
+    # can reach it? For a synthetic task the two questions coincide, because its
+    # oracle_plan is an executable reference solution built from the same world.
+    # For a REAL task they do not: MuSiQue's `question_decomposition` is a sketch,
+    # not a plan -- 59.3% of its queries still carry an unresolved "#N" placeholder
+    # ("Who besides the british colonized #1 ?"), which is not an executable BM25
+    # query. Replaying those calls 52.5% of real tasks unretrievable while 100% of
+    # them do contain their answer in their own 20 passages. So `retrievable` is
+    # sourced differently per kind, and both raw signals stay visible.
+    in_corpus = any(want in norm_text(f"{d.get('title', '')} {d.get('text', '')}")
+                    for d in (getattr(task, "documents", None) or []))
+    if src == "real":
+        return {"retrievable": in_corpus, "in_last_call": hit_last, "source": src,
+                "answer_in_corpus": in_corpus, "plan_executable": first_hit is not None,
+                "first_hit_call": first_hit, "num_calls": len(calls), "skipped": False}
+    return {"retrievable": first_hit is not None, "in_last_call": hit_last, "source": src,
+            "answer_in_corpus": first_hit is not None, "plan_executable": first_hit is not None,
             "first_hit_call": first_hit, "num_calls": len(calls), "skipped": False}
 
 
@@ -92,9 +113,21 @@ def audit(tasks: Sequence[Task], env: str = "builtin", text_loader=None) -> dict
             "unretrievable": len(fam_bad),
             "unretrievable_rate": round(len(fam_bad) / max(1, len(fam_rows)), 4),
         }
+    by_source: dict[str, dict] = {}
+    for src in sorted({r["source"] for _, r in scored}):
+        src_rows = [(t, r) for t, r in scored if r["source"] == src]
+        src_bad = [1 for _, r in src_rows if not r["retrievable"]]
+        by_source[src] = {
+            "n": len(src_rows),
+            "unretrievable": len(src_bad),
+            "unretrievable_rate": round(len(src_bad) / max(1, len(src_rows)), 4),
+            # only meaningful for real tasks; equals `retrievable` for synthetic
+            "plan_executable": sum(1 for _, r in src_rows if r["plan_executable"]),
+        }
     return {
         "n": len(rows),
         "n_scored": len(scored),
+        "by_source": by_source,
         "n_skipped": len(rows) - len(scored),
         "unretrievable": len(bad),
         "unretrievable_rate": round(len(bad) / max(1, len(scored)), 4),
@@ -116,6 +149,10 @@ def assert_answer_retrievable(tasks: Sequence[Task], env: str = "builtin",
     reference solution, and any dataset collected from it teaches guessing.
     """
     rep = audit(tasks, env=env, text_loader=text_loader)
+    # NOTE for real tasks: `retrievable` means "the answer is in the task's own
+    # candidate set", NOT "the oracle_plan retrieves it" -- see check_task. Never
+    # point the plan-executability axis at a real pool expecting 0%: MuSiQue's
+    # decomposition queries are not executable and ~52% of them do not resolve.
     if rep["unretrievable_rate"] > max_rate:
         lines = [f"  {tid:<28} {route:<52} {ans}"
                  for tid, route, _prompt, ans in rep["failures"]]

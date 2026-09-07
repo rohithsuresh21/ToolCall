@@ -20,6 +20,17 @@ TASK_TYPES = [
 ]
 
 
+def task_source(task) -> str:
+    """"real" for a task carrying its own candidate set, "synthetic" otherwise.
+
+    The single place this distinction is named. A real MuSiQue task owns its
+    20 passages; a synthetic one derives them from its seed. Almost everything
+    that treats the two alike is a bug -- the sufficiency checks, the world
+    builder and the GRPO group accounting all branch on it.
+    """
+    return "real" if getattr(task, "documents", None) else "synthetic"
+
+
 @dataclass
 class Task:
     task_id: str

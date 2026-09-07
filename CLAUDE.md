@@ -30,6 +30,7 @@ python tests/test_answer_f1.py         # token-F1 judge metric + reward/verifier
 python tests/test_shortcut_filter.py   # shortcut + prefix-leak filters, train/dev route holdout
 python tests/test_naturalize.py        # naturalization with a mock LLM (offline)
 python tests/test_grpo_resume.py       # GRPO checkpoint/resume/wall-clock stop (CPU, no model)
+python tests/test_source_split.py      # per-source (synthetic/real) GRPO group accounting
 python tests/audit_sft.py data/sft.jsonl  # built-set audit: psychic queries, unretrieved/early answers, label conflicts
 python tests/verify_dataset.py         # needs artifacts/naturalized_passages_scaled.json
 python tests/verify_naturalize_live.py # needs artifacts/naturalized_passages.json
@@ -217,6 +218,55 @@ intermediate retrieval form does not help beyond the outcome signal. `args_stric
 still COMPUTED and still reported by eval — it reads how far the policy has drifted from the
 reference phrasing — it just no longer moves the gradient. Do not re-weight it without
 re-fixing the oracle to a single phrasing first.
+
+**A task is SYNTHETIC or REAL, and `task_source()` is the only place that decides.**
+A real MuSiQue-Ans train task (`data/musique_train_tasks.jsonl`, 3975 rows built by
+`scripts/make_musique_train_tasks.py`) carries its own 20-passage candidate set on
+`Task.documents`; that set REPLACES the seeded synthetic world, because its `seed` is a
+fingerprint of the source row rather than a world recipe. `GRPOConfig.real_tasks_path` /
+`real_fraction` mix them into each step's task draw.
+
+**`world_for_task()` is the one place that turns a task into a World.** The rule used to be
+inlined in `_Episode.__init__` alone, so `retrievability.check_task` kept calling
+`build_world(task.seed)` and scored real tasks against a synthetic corpus — reporting 40/40 of
+them "unretrievable" at rate 1.0, a number that reads as a data defect and is actually the
+wrong world. Both call it now. Anything else that needs an episode's corpus must too.
+
+**The four-axis sufficiency gate is synthetic-only, structurally.** It lives inside
+`gen_musique`, which is reachable only from `generate()` / `dev_set()`; real tasks are LOADED
+from jsonl and never pass through it, so they are neither rejected nor crashed on — verified,
+not assumed. The gate could not meaningfully apply to them anyway: `route` on a real task is
+the evidence-id list (`['3','6']`), not `_REL` keys, and `len(oracle_plan) == len(route)` with
+no terminal read, so both the gate's assumptions and `_plan_shape`'s
+`len(oracle_plan) == len(route) + 1` assertion are synthetic-only invariants. Do not point
+either at the real pool.
+
+**Real sufficiency is measured on the CORPUS, not on the plan.** MuSiQue's
+`question_decomposition` is a sketch, not an executable plan: 59.3% of its queries still carry
+an unresolved `#N` placeholder ("Who besides the british colonized #1 ?"), which is not a BM25
+query. Replaying them leaves 52.5% of real tasks "unretrievable" while **100% of all 3975 do
+contain their gold answer in their own 20 passages**. So `check_task` sources `retrievable`
+differently per kind and reports `answer_in_corpus` and `plan_executable` separately;
+`audit()` splits by source. A 0% plan-executability expectation on real tasks is wrong by
+construction.
+
+**Disjointness from the judge probe is re-verified, not inherited.** `data/judge_tasks.jsonl`
+(54 rows) vs the 3975 train rows, by both fingerprints: **0 question-text collisions** (and 0
+substring containments either direction), **0 evidence-id signature intersections** (143 judge
+evidence ids vs 4732 train, zero shared), 0 identical sample ids. Note the id signature must
+drop non-digit tokens — `3hop1__10003_...` uses `hop1__` as its separator, so a naive
+`split("hop__")` leaks the `3` and `1` from the prefix and manufactures 2375 phantom
+collisions on `['1','3']`.
+
+**Per-source group accounting is what should set `real_fraction`.** 0.2 is a placeholder chosen
+before MuSiQue was permitted. A GRPO group is all rollouts of ONE task, so it has exactly one
+source; `assign_advantages` stamps it and returns `groups_by_source`, `collect_batch` returns
+`by_source` (sampled / live / discarded / live_rate / reasons per source), and both land in the
+history row. `_sampled_stats` adds `smp_f1_by_source`. Read `live_rate`: a group dies from lack
+of DISAGREEMENT, not from low reward, so synthetic 2-hop at ~100% F1 produces `zero_variance`
+deaths and contributes no gradient however many are drawn, while real tasks near 46% disagree
+with themselves and stay live. `tests/test_source_split.py` pins that the two rates separate in
+a single step.
 
 **Retrieval checks read parsed `title` + `text`, never the raw tool_response string.** The
 rendered block also carries `doc_id` and the BM25 `score` float, and `norm_text` deletes
