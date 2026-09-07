@@ -26,6 +26,7 @@ Swap-out note: when the organizers' real tool environment arrives, this file and
 from __future__ import annotations
 
 import random
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -209,31 +210,120 @@ def build_world(seed: int, text_loader=None) -> World:
     return w
 
 
+# --- passage prose realisations --------------------------------------------
+# Three renderings per entity kind, chosen deterministically per (seed, doc_id).
+#
+# Why they are UNANCHORED. The old single template stated every fact in the exact
+# words the question would ask it in -- "The official language is X", "was founded
+# in Y", "has a population of Z" -- so the leaf keyword in the oracle's terminal
+# query was guaranteed to be a literal term in the passage that owned the answer.
+# BM25 then found it whatever else was in the corpus, and the model was trained on
+# a retrieval problem that does not exist outside this generator. That is a large
+# part of the synthetic-to-real gap.
+#
+# Real Wikipedia does the opposite: the passage that owns a fact often does NOT
+# contain the phrasing you searched for, while its SIBLINGS do. Unanchoring
+# reproduces exactly that. Traced live before the gate existed: the query
+# "Khaldonia official language" scored Vestorland 4.66, Caldury 4.57, Orinella
+# 4.57 and Khaldonia -- the passage that owns the answer -- only 4.25, because
+# those three kept the literal keyword and Khaldonia's realisation did not. At
+# top_k=3 the right passage is dropped. Training against that is the point; the
+# generation-time gate (`generator._is_unretrievable`) is what keeps a task whose
+# answer is genuinely unreachable out of the dataset instead.
+#
+# TWO INVARIANTS every realisation must hold, or gold answers and hops break:
+#   1. every attribute VALUE appears verbatim -- same formatting, so a population
+#      keeps its comma grouping (norm_text strips punctuation consistently on both
+#      sides, but only if both sides were written the same way);
+#   2. every LINKED ENTITY NAME still appears, because walking a chain means
+#      reading the next entity's name out of the current passage.
+# What varies is the framing words around them, and only those.
+_PASSAGE_TEMPLATES = {
+    "country": [
+        lambda n, a: (f"{n} is a {a['region']} country. Its capital city is {a['capital']}. "
+                      f"It has an estimated population of {a['population']:,}. "
+                      f"The official language is {a['official_language']}."),
+        lambda n, a: (f"Situated in the {a['region']} region, {n} administers its affairs "
+                      f"from {a['capital']}. Its residents number roughly "
+                      f"{a['population']:,}, and they predominantly speak "
+                      f"{a['official_language']}."),
+        lambda n, a: (f"{n}, a {a['region']} state, is governed from {a['capital']}. Census "
+                      f"figures put its inhabitants at {a['population']:,}; "
+                      f"{a['official_language']} serves as the language of record."),
+    ],
+    "feature": [
+        lambda n, a: (f"{n} is a {a['kind']} located in {a['located_in']}. It extends "
+                      f"approximately {a['length_km']} km and is notable for {a['notable_for']}."),
+        lambda n, a: (f"{n}, a {a['kind']} within {a['located_in']}, runs for some "
+                      f"{a['length_km']} km and draws attention for {a['notable_for']}."),
+        lambda n, a: (f"Stretching roughly {a['length_km']} km across {a['located_in']}, the "
+                      f"{a['kind']} {n} is chiefly associated with {a['notable_for']}."),
+    ],
+    "city": [
+        lambda n, a: (f"{n} is the capital city of {a['country']}. It has a population of "
+                      f"{a['population']:,} and was founded in {a['founded_in']}."),
+        lambda n, a: (f"{n} serves as the seat of government of {a['country']}. Some "
+                      f"{a['population']:,} residents live within its limits, and the "
+                      f"settlement dates to {a['founded_in']}."),
+        lambda n, a: (f"Established in {a['founded_in']}, {n} is where {a['country']} seats "
+                      f"its administration. It is home to {a['population']:,} people."),
+    ],
+    "organisation": [
+        lambda n, a: (f"{n} is an organisation active in the field of {a['field']}. It is "
+                      f"headquartered in {a['headquartered_in']} and was founded in "
+                      f"{a['founded_in']}." + _founder_clause(a, 0)),
+        lambda n, a: (f"{n} operates in {a['field']} and keeps its head office in "
+                      f"{a['headquartered_in']}. It began trading in {a['founded_in']}."
+                      + _founder_clause(a, 1)),
+        lambda n, a: (f"Dating from {a['founded_in']}, {n} is a {a['field']} concern based in "
+                      f"{a['headquartered_in']}." + _founder_clause(a, 2)),
+    ],
+    "person": [
+        lambda n, a: (f"{n} is a {a['profession']} born in {a['born_in']} in "
+                      f"{a['year_of_birth']}. They are best known for their work at "
+                      f"{a.get('employed_by') or 'an unnamed employer'}."),
+        lambda n, a: (f"A {a['profession']} by training, {n} hails from {a['born_in']} and "
+                      f"entered the world in {a['year_of_birth']}. Much of their career has "
+                      f"been spent at {a.get('employed_by') or 'an unnamed employer'}."),
+        lambda n, a: (f"{n} is a {a['profession']} and a native of {a['born_in']}, whose life "
+                      f"began in {a['year_of_birth']}. They are currently attached to "
+                      f"{a.get('employed_by') or 'an unnamed employer'}."),
+    ],
+    "work": [
+        lambda n, a: (f"{n} is a {a['kind']} published in {a['published_in']}. "
+                      f"It was created by {a['author']}."),
+        lambda n, a: (f"{n}, a {a['kind']}, appeared in {a['published_in']}. "
+                      f"{a['author']} is credited as its creator."),
+        lambda n, a: (f"Released in {a['published_in']}, the {a['kind']} {n} came from the "
+                      f"hand of {a['author']}."),
+    ],
+}
+
+
+def _founder_clause(a: dict, variant: int) -> str:
+    """The founder sentence, varied alongside the rest and omitted when unset.
+
+    `organisation.founder` is what makes the org -> person edge exist at all (see
+    build_world), so the NAME has to survive every realisation; only the wording
+    around it moves."""
+    f = a.get("founder")
+    if not f:
+        return ""
+    return [f" Its founder is {f}.", f" The company was started by {f}.",
+            f" {f} established it."][variant % 3]
+
+
 def _passage(e: dict, w: World) -> dict:
-    """Render one Wikipedia-style passage (title + text) from an entity."""
+    """Render one Wikipedia-style passage (title + text) from an entity.
+
+    The realisation is picked by a hash of (world seed, doc_id) rather than drawn
+    from build_world's own rng: the world must stay a pure function of the seed,
+    and drawing here would consume from the stream that generates the attributes,
+    silently changing the gold answer of every existing seed."""
     a = e["attrs"]
-    kind = e["kind"]
-    if kind == "country":
-        text = (f"{e['name']} is a {a['region']} country. Its capital city is "
-                f"{a['capital']}. It has an estimated population of {a['population']:,}. "
-                f"The official language is {a['official_language']}.")
-    elif kind == "feature":
-        text = (f"{e['name']} is a {a['kind']} located in {a['located_in']}. It extends "
-                f"approximately {a['length_km']} km and is notable for {a['notable_for']}.")
-    elif kind == "city":
-        text = (f"{e['name']} is the capital city of {a['country']}. It has a population of "
-                f"{a['population']:,} and was founded in {a['founded_in']}.")
-    elif kind == "organisation":
-        text = (f"{e['name']} is an organisation active in the field of {a['field']}. It is "
-                f"headquartered in {a['headquartered_in']} and was founded in {a['founded_in']}. "
-                f"{'Its founder is ' + a['founder'] + '.' if a.get('founder') else ''}")
-    elif kind == "person":
-        emp = a.get("employed_by") or "an unnamed employer"
-        text = (f"{e['name']} is a {a['profession']} born in {a['born_in']} in {a['year_of_birth']}. "
-                f"They are best known for their work at {emp}.")
-    else:  # work
-        text = (f"{e['name']} is a {a['kind']} published in {a['published_in']}. "
-                f"It was created by {a['author']}.")
+    variants = _PASSAGE_TEMPLATES[e["kind"]]
+    idx = zlib.crc32(f"{w.seed}:{e['id']}".encode("utf-8")) % len(variants)
+    text = variants[idx](e["name"], a)
     return {
         "doc_id": e["id"],
         "title": e["name"],

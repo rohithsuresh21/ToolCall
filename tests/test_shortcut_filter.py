@@ -8,35 +8,38 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from atr.tasks.generator import (
     generate, dev_set, gen_musique,
-    _ROUTES_TRAIN, _ROUTES_DEV_ONLY, _REL,
+    _ROUTES_TRAIN, _ROUTES_DEV_ONLY, _REL, _LEAF_ATTR,
+    _REL_QUERY_VARIANTS, _LEAF_QUERY_VARIANTS,
     _is_shortcut_solvable, _is_prefix_leaky, _SHORTCUT_STATS,
+    _is_unretrievable, _prefix_report, _resolve_chain, _leaf_attr_options,
+    _build_route_oracle, _variant_rng,
 )
 from atr.tools.world import build_world
 from atr.tasks.schema import Task
 import random
 
 
-def _kw_to_step():
-    return {_REL[k][4]: k for k in _REL}
-
-
 def _plan_shape(task):
-    """Reconstruct the route shape (step-key list) a task used, from its oracle_plan.
+    """The route shape (step-key list) a task used, read from the task itself.
 
-    A route of L relation steps plans L+1 searches: L that walk the chain, then a
-    TERMINAL READ of the leaf's own passage (see _build_route_oracle). Only the
-    first L encode relations, so the last step is dropped before mapping. It has to
-    be positional rather than keyword-based: the leaf-attribute keywords overlap the
-    relation keywords ("born", "founded", "field"), so a trailing-keyword lookup
-    would silently mis-resolve the read as another hop."""
-    step_for = _kw_to_step()
-    steps = []
-    for q in task.oracle_plan[:-1]:
-        kw = q["arguments"]["query"].rsplit(" ", 1)[-1]
-        s = step_for.get(kw)
-        if s is None:
-            return None
-        steps.append(s)
+    This used to RECONSTRUCT the shape by taking the last word of each oracle query
+    and mapping it back through `_REL[k][4]`. That worked only while every relation
+    had exactly one query realisation. Once the oracle's phrasing varies
+    (`_REL_QUERY_VARIANTS`), the trailing word is "government", "birthplace" or
+    "office" as often as it is the canonical keyword, and 564 of 600 tasks became
+    unresolvable -- the tests below would have failed on the reconstruction rather
+    than on the property they exist to check.
+
+    `gen_musique` has always set `task.route`, so the shape is recorded rather than
+    inferred. The assertion is the part worth keeping: an L-hop route plans L+1
+    searches (L to walk the chain + one terminal read), and a task whose plan
+    length does not match its route length is malformed however it was built."""
+    if not task.route:
+        return None
+    steps = list(task.route)
+    assert len(task.oracle_plan) == len(steps) + 1, (
+        f"FAIL: {task.task_id} route {steps} (len {len(steps)}) but "
+        f"{len(task.oracle_plan)} planned searches; an L-hop route plans L+1")
     return steps
 
 
@@ -253,9 +256,8 @@ import atr.tasks.generator as _g
 
 
 def _collect(seed_start, n):
-    _g._SHORTCUT_STATS["checked"] = 0
-    _g._SHORTCUT_STATS["rejected"] = 0
-    _g._SHORTCUT_STATS["prefix_rejected"] = 0
+    for k in _g._SHORTCUT_STATS:
+        _g._SHORTCUT_STATS[k] = 0
     generate(n, seed_start=seed_start)
     return dict(_g._SHORTCUT_STATS)
 
@@ -272,6 +274,144 @@ def test_filter_observable_rejection_rate():
     assert s["prefix_rejected"] > 0, "FAIL: prefix-leak filter rejected zero candidates"
     prate = s["prefix_rejected"] / s["checked"]
     assert 0.10 <= prate <= 0.80, f"FAIL: unreasonable prefix rejection rate {prate:.0%}"
+
+
+# --- sufficiency: the two axes added with the unanchored passage prose -------
+# The filters above reject tasks that leak the answer EARLY. These two reject the
+# opposite defect: a task whose own oracle plan cannot reach the information it
+# needs. Both became possible when the passage templates stopped restating each
+# fact in the exact words the question asks it in (world._PASSAGE_TEMPLATES).
+
+
+def test_retrievability_gate_is_not_vacuous():
+    """`_is_unretrievable` must actually fire on a real candidate.
+
+    A gate that never rejects anything is indistinguishable from no gate, and it
+    would leave `assert_answer_retrievable` -- which only runs after a build -- as
+    the sole defence. The known case is seed 735: the query "Khaldonia official
+    language" scores Vestorland 4.66, Caldury 4.57 and Orinella 4.57 above
+    Khaldonia's own 4.25, because those three realisations kept the literal
+    keyword and Khaldonia's did not, so top_k=3 drops the passage that owns the
+    answer. Scanned over the raw candidate stream it is rare (~1 in 8600), which
+    is exactly why it needs a pinned reproduction rather than a rate check."""
+    seed = 735
+    w = build_world(seed)
+    steps = ["person_city", "city_country"]
+    rng = random.Random(seed * 7919 + 13)
+    chain = _resolve_chain(w, rng, steps)
+    assert chain is not None, "FAIL: the pinned seed no longer resolves its route"
+    hit = False
+    for _word, gold, _ans, leaf_kw in _leaf_attr_options(random.Random(0), chain[-1]):
+        vrng = _variant_rng(seed, steps, leaf_kw)
+        hop_kws = [vrng.choice(_REL_QUERY_VARIANTS[st]) for st in steps]
+        leaf_q = vrng.choice(_LEAF_QUERY_VARIANTS.get(leaf_kw, [leaf_kw]))
+        plan = _build_route_oracle(steps, chain, leaf_q, hop_kws)
+        if _is_unretrievable(w, plan, gold):
+            hit = True
+    assert hit, ("FAIL: the retrievability gate fires on nothing at the pinned seed "
+                 "-- it is dead code, or the passage realisations changed")
+
+
+def test_no_generated_task_is_unretrievable():
+    """Every minted task's TERMINAL read surfaces its own gold answer."""
+    bad = []
+    for t in generate(200, seed_start=0):
+        if not t.route:
+            continue
+        w = build_world(t.seed)
+        gold = t.gold
+        if _is_unretrievable(w, t.oracle_plan, gold):
+            bad.append((t.task_id, ">".join(t.route), t.oracle_answer))
+    assert not bad, f"FAIL: {len(bad)} tasks cannot retrieve their own answer: {bad[:5]}"
+
+
+def test_no_generated_task_has_a_broken_chain():
+    """Every hop reveals the entity the NEXT hop's query is written from.
+
+    Without this the plan is only followable by someone who already knows the
+    name, which is the psychic-query defect. The live failure it guards: the city
+    realisation "X serves as the seat of government of Y" puts that literal phrase
+    in six CITY passages, so the walk query "<Country> seat of government" comes
+    back with three unrelated cities and never names the country's own capital.
+    The TERMINAL read still works in that case (it searches the leaf by name), so
+    `_is_unretrievable` passes and only this check catches it."""
+    bad = []
+    checked = 0
+    for t in generate(200, seed_start=0):
+        if not t.route:
+            continue
+        # The task's OWN chain, not a re-resolution of its route: `_resolve_chain`
+        # draws from the generator's rng, so replaying it on a fresh Random lands
+        # on different entities and the check would fail against a chain the task
+        # never used. That is why Task.chain is recorded.
+        assert len(t.chain) == len(t.route) + 1, \
+            f"FAIL: {t.task_id} chain {t.chain} does not match route {t.route}"
+        checked += 1
+        w = build_world(t.seed)
+        _leaky, broken = _prefix_report(w, t.oracle_plan,
+                                        [{"name": n} for n in t.chain], t.gold)
+        if broken:
+            bad.append((t.task_id, ">".join(t.route)))
+    assert checked, "FAIL: no multi-hop tasks checked"
+    assert not bad, f"FAIL: {len(bad)}/{checked} tasks have an unfollowable hop: {bad[:5]}"
+
+
+def test_oracle_query_phrasing_actually_varies():
+    """The oracle plan must not emit one fixed string per relation.
+
+    A single realisation per relation trains a lookup table keyed on the question
+    template -- "<Entity> capital", "<Entity> author" -- which is a surface form
+    the real judge questions never use. Both tables must contribute: a relation
+    whose variants list collapsed to one entry would pass a global count."""
+    for table, label in ((_REL_QUERY_VARIANTS, "relation"), (_LEAF_QUERY_VARIANTS, "leaf")):
+        for key, variants in table.items():
+            assert len(variants) >= 2, f"FAIL: {label} {key} has only {len(variants)} realisation(s)"
+            assert len(set(variants)) == len(variants), f"FAIL: {label} {key} repeats a realisation"
+
+    # Index 0 is the CANONICAL keyword. Anything mapping a keyword back to a step
+    # reads `_REL[k][4]`, and `_build_route_oracle` falls back to it when no
+    # realisations are passed, so a drifted index 0 would make the varied set stop
+    # being a superset of the old fixed set and the fallback stop matching.
+    for step, variants in _REL_QUERY_VARIANTS.items():
+        assert variants[0] == _REL[step][4], \
+            f"FAIL: {step} variant[0] {variants[0]!r} != canonical {_REL[step][4]!r}"
+
+    # Every leaf keyword must HAVE realisations. A missing key is not an error at
+    # runtime -- gen_musique falls back to [leaf_kw] -- so that attribute would
+    # silently keep one fixed phrasing while every other one varied.
+    leaf_kws = {opts[k][2] for opts in _LEAF_ATTR.values() for k in opts}
+    missing = leaf_kws - set(_LEAF_QUERY_VARIANTS)
+    assert not missing, f"FAIL: leaf keywords with no realisations (they would not vary): {missing}"
+    seen = set()
+    for t in generate(200, seed_start=0):
+        for step in t.oracle_plan:
+            seen.add(step["arguments"]["query"].split(" ", 1)[-1])
+    assert len(seen) >= 15, f"FAIL: only {len(seen)} distinct query phrasings across 200 tasks"
+
+
+def test_phrasing_does_not_shift_the_generator_stream():
+    """Phrasing is drawn from `_variant_rng`, never from the generator's own rng.
+
+    Drawing it from `rng` would consume from the stream that picks routes,
+    resolves chains and orders leaf attributes, so every seed would mint a
+    DIFFERENT task than before -- silently re-pointing the train/dev seed ranges
+    the whole no-leakage argument rests on. The check: the same seed must produce
+    the same question, gold and route no matter which realisation it drew, and a
+    realisation must be stable across calls."""
+    for seed in (0, 17, 123, 900_001):
+        w = build_world(seed)
+        a = gen_musique(w, random.Random(seed * 7919 + 13), seed, 3, "musique_3hop",
+                        filter_shortcuts=False, route_pool="train")
+        b = gen_musique(build_world(seed), random.Random(seed * 7919 + 13), seed, 3,
+                        "musique_3hop", filter_shortcuts=False, route_pool="train")
+        if a is None and b is None:
+            continue
+        assert a is not None and b is not None, f"FAIL: seed {seed} minted inconsistently"
+        assert (a.prompt, a.gold, a.route) == (b.prompt, b.gold, b.route), \
+            f"FAIL: seed {seed} is not reproducible"
+        assert [s["arguments"]["query"] for s in a.oracle_plan] == \
+               [s["arguments"]["query"] for s in b.oracle_plan], \
+            f"FAIL: seed {seed} drew different phrasings on two identical calls"
 
 
 def run_all():

@@ -59,7 +59,18 @@ class RewardConfig:
                                        # continuous, so hard groups stay alive
     w_selection: float = 0.10
     w_args: float = 0.10
-    w_args_strict: float = 0.05
+    # 0.0 deliberately. This term scored the model's query string against the
+    # ORACLE'S EXACT string. That was already a weak proxy, and it became noise
+    # once the oracle's own phrasing was randomised across three realisations per
+    # relation (generator._REL_QUERY_VARIANTS): an identically good query now
+    # matches the drawn realisation about one time in three, so the term pays out
+    # on a coin flip the policy cannot observe or control. TIER and Search-R1 both
+    # report that rewarding intermediate retrieval form does not help beyond the
+    # outcome signal, which is the same conclusion from the other direction.
+    # `args_strict_frac` is still COMPUTED and still reported by eval -- it is a
+    # useful read on how far the policy has drifted from the reference phrasing;
+    # it just no longer moves the gradient.
+    w_args_strict: float = 0.0
     w_format_strict: float = 0.05
     w_recovery: float = 0.10
     p_side_effect: float = 0.50        # unrequested write
@@ -80,7 +91,7 @@ class RewardConfig:
     w_progress: float = 0.20
     w_reformulate: float = 0.10
     clip_low: float = -1.0
-    # Max positive sum is 1.00+0.30+0.10+0.10+0.05+0.05+0.10 = 1.70. The per-hop
+    # Max positive sum is 1.00+0.30+0.10+0.10+0.00+0.05+0.10 = 1.65. The per-hop
     # chain shaping (w_anchor+w_progress+w_reformulate = +0.45) fires ONLY on
     # failed episodes, so it never stacks with the outcome terms on a solved task
     # and does not raise the ceiling. At a ceiling that did not clear 1.70 an

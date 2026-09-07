@@ -42,6 +42,21 @@ class Task:
                                                               # the real diversity axis (see
                                                               # rejection._shape). Empty for
                                                               # families with no chain.
+    chain: list[str] = field(default_factory=list)            # the ENTITY NAMES `route`
+                                                              # resolved to, head first, leaf
+                                                              # last. `route` says which
+                                                              # relations were walked; this
+                                                              # says what they landed on, and
+                                                              # it is len(route)+1 long.
+                                                              # Recorded because the chain is
+                                                              # drawn from the generator's rng
+                                                              # and CANNOT be recovered later:
+                                                              # re-resolving the same route on
+                                                              # a fresh Random gives different
+                                                              # entities. Without it, whether
+                                                              # each hop actually reveals the
+                                                              # next entity is only checkable
+                                                              # at generation time.
     expect_side_effect: dict | None = None                    # e.g. {"to": ..., "must_contain": [...]}
     notes: str = ""
 

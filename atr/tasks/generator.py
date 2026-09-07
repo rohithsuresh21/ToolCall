@@ -21,6 +21,7 @@ curriculum sorts on.
 from __future__ import annotations
 
 import random
+import zlib
 from typing import Callable
 
 from ..tools.adapter import get_registry
@@ -218,6 +219,61 @@ _LEAF_ATTR = {
     "person":     {"year_of_birth": ("year of birth ", "numeric", "born")},
 }
 
+# --- query phrasing realisations -------------------------------------------
+# The oracle plan is the reference SFT target, so its query strings are the exact
+# surface form the model learns to emit. With ONE realisation per relation the
+# model learns a lookup table -- "<Entity> capital", "<Entity> author" -- keyed on
+# the question's template wording, which is a form the real judge questions never
+# use. That is a large part of the synthetic-to-real gap: 100% on synthetic 2-hop
+# against 46.4% on the real 2-hop rows.
+#
+# Retrieval itself is phrasing-INSENSITIVE here, which is what makes this cheap:
+# every query leads with the entity name and `search` boosts a title match 1.6x,
+# so the source passage is retrieved on the name and the keyword only says which
+# fact to read. Measured over 600 tasks, 3 realisations per relation gave
+# identical per-family yields and zero additional unretrievable tasks.
+#
+# Index 0 is the canonical keyword and MUST equal the one in the table above --
+# it is the identity of the relation for anything that maps a keyword back to a
+# step, and the entry that keeps the varied set a superset of the old fixed set.
+_REL_QUERY_VARIANTS = {
+    "feature_country":  ["country", "located in country", "which country"],
+    "country_city":     ["capital", "capital city", "seat of government"],
+    "city_country":     ["country", "which country", "nation"],
+    "person_city":      ["born", "birthplace", "born in city"],
+    "person_org":       ["company", "employer", "employed by"],
+    "org_city":         ["headquarters", "headquartered in", "head office"],
+    "work_person":      ["author", "written by", "creator"],
+    "org_founder":      ["founder", "founded by", "who founded"],
+}
+
+# Same idea for the TERMINAL READ, keyed on the canonical leaf keyword. "founded"
+# is deliberately shared by city.founded_in and organisation.founded_in: it is the
+# same question asked of two kinds, and it should vary the same way for both.
+_LEAF_QUERY_VARIANTS = {
+    "official language": ["official language", "language spoken", "primary language"],
+    "population":        ["population", "number of inhabitants", "total inhabitants"],
+    "founded":           ["founded", "year founded", "date of foundation"],
+    "field":             ["field", "field of activity", "industry"],
+    "born":              ["born", "year of birth", "birth year"],
+}
+
+
+def _variant_rng(seed: int, steps: list[str], leaf_kw: str) -> random.Random:
+    """A SEPARATE deterministic stream for phrasing choices.
+
+    Drawing the realisations from the generator's own `rng` would consume from the
+    stream that picks routes, resolves chains and orders leaf attributes, so every
+    task minted after this change would differ from the same seed before it -- the
+    train/dev seed ranges would silently re-point and the "pure function of the
+    seed" contract would hold only within a single version of this file. Keying a
+    fresh Random on (seed, route, leaf attribute) keeps phrasing reproducible and
+    leaves the generator's draw order byte-identical.
+    """
+    key = f"{seed}|{'>'.join(steps)}|{leaf_kw}"
+    return random.Random(zlib.crc32(key.encode("utf-8")))
+
+
 # route templates by hop count: each is a list of _REL keys. Any leaf kind that
 # the route reaches is valid as long as _LEAF_ATTR covers it, so the builder
 # picks a terminal attribute present on the leaf.
@@ -373,7 +429,8 @@ def _resolve_chain(w: World, rng: random.Random, steps: list[str]) -> list[dict]
 # clean candidate always exists, so 100% of seeds still mint at every hop length);
 # it lands on the build instead, where the surviving questions are less varied and
 # dedupe_by_question drops more -- 2457 -> 1951 records off the same 6000 seeds.
-_SHORTCUT_STATS = {"checked": 0, "rejected": 0, "prefix_rejected": 0}
+_SHORTCUT_STATS = {"checked": 0, "rejected": 0, "prefix_rejected": 0,
+                   "broken_chain_rejected": 0, "unretrievable_rejected": 0}
 
 
 def _norm_find(gold: dict) -> str:
@@ -423,6 +480,90 @@ def _is_prefix_leaky(w: World, plan: list[dict], gold: dict) -> bool:
     return False
 
 
+def _prefix_report(w: World, plan: list[dict], chain: list[dict],
+                   gold: dict) -> tuple[bool, bool]:
+    """One replay of the plan's PRE-TERMINAL calls, reporting two failures.
+
+    `leaky`  -- the gold answer already appears before the terminal read, so the
+                chain is truncatable (the same axis as `_is_prefix_leaky`, which
+                stays as the standalone form the tests exercise).
+    `broken` -- call k does not reveal the name of chain[k+1], the entity whose
+                name call k+1 is written from. The plan then only works for
+                someone who already knows that name, which is the definition of
+                the psychic-query defect this repo removed once before.
+
+    `broken` is a NEW failure introduced by unanchoring the passage prose, and it
+    is the same mechanism as the Khaldonia trace pointed the other way. The city
+    realisation "X serves as the seat of government of Y" puts the literal phrase
+    "seat of government" in six CITY passages; the walk query for a country's
+    capital is "<Country> seat of government"; so the query out-scores the country
+    passage on its own siblings and comes back with three unrelated cities. Traced
+    live: "Khaldonia seat of government" returned Osthavn, Belvora and Nyrmont,
+    none of which is Khaldonia's capital and none of which names it. The terminal
+    read still surfaces the gold answer (it searches the leaf by name), so
+    `_is_unretrievable` passes and the task looks fine -- it is only the HOP that
+    is unusable. Rejecting here is what keeps that out of the training set.
+
+    Both axes come from a single pass because the calls are identical; checking
+    them separately would double the searches this filter spends per candidate.
+    """
+    want = _norm_find(gold)
+    reg = get_registry("builtin")
+    leaky = broken = False
+    for k, step in enumerate(plan[:-1]):
+        res = reg.call(w, "search", dict(step["arguments"]))
+        hits = res.get("results", []) or []
+        # title AND text, per-hit: the tool_response block renders both, and a
+        # gold answer that IS an entity name leaks through a co-retrieved title.
+        # Per-hit rather than over a joined blob, so a match cannot be
+        # manufactured across two passages' boundary.
+        texts = [norm_text(f"{h.get('title', '')} {h.get('text', '')}") for h in hits]
+        if want and any(want in t for t in texts):
+            leaky = True
+        nxt = norm_text(chain[k + 1]["name"]) if k + 1 < len(chain) else ""
+        if nxt and not any(nxt in t for t in texts):
+            broken = True
+    return leaky, broken
+
+
+def _is_unretrievable(w: World, plan: list[dict], gold: dict) -> bool:
+    """True if the plan's TERMINAL READ does not surface the gold answer.
+
+    This is the sufficiency axis, enforced at GENERATION time rather than only
+    asserted after the fact by `assert_answer_retrievable`. It exists because the
+    passage prose is no longer anchored to the query keyword: a country passage may
+    say "Residents speak Caldish" while its SIBLING country passages still contain
+    the literal words "official language", so a query "<Leaf> official language"
+    ranks the siblings above the passage that owns the fact and top_k=3 drops it.
+    Traced live: "Khaldonia official language" scored Vestorland 4.66, Caldury 4.57,
+    Orinella 4.57 and Khaldonia only 4.25.
+
+    That is exactly what real Wikipedia does to a retriever, so the response is to
+    generate against it rather than to anchor the templates around it: reject the
+    candidate here and fall through to the leaf's next terminal attribute, the same
+    way `_is_prefix_leaky` does. Only the terminal call is replayed -- the
+    pre-terminal ones are already known not to contain the answer, because
+    `_is_prefix_leaky` ran first and rejected the candidate if they did. So the gate
+    costs exactly ONE extra search per surviving candidate.
+
+    Without it, unanchored templates leave ~1 in 600 tasks with its gold string
+    absent from the whole episode, which fails `assert_answer_retrievable` and
+    reddens 00_sanity.sh -- the sanity gate would catch it, but only after a build.
+    """
+    want = _norm_find(gold)
+    if not want:
+        return False
+    reg = get_registry("builtin")
+    res = reg.call(w, "search", dict(plan[-1]["arguments"]))
+    for hit in res.get("results", []) or []:
+        # title AND text, the same pair every other retrieval check reads; never
+        # the raw tool_response string, whose BM25 `score` float substring-matches
+        # numeric gold answers once norm_text has deleted the punctuation.
+        if want in norm_text(f"{hit.get('title', '')} {hit.get('text', '')}"):
+            return False
+    return True
+
+
 def _leaf_attr_options(rng: random.Random, leaf: dict) -> list[tuple[str, dict, str, str]]:
     """Every terminal attribute present on the leaf passage, in random order.
 
@@ -456,7 +597,8 @@ def _phrase_chain(steps: list[str], chain: list[dict]) -> str:
     return phrase
 
 
-def _build_route_oracle(steps: list[str], chain: list[dict], leaf_kw: str) -> list[dict]:
+def _build_route_oracle(steps: list[str], chain: list[dict], leaf_kw: str,
+                        hop_kws: list[str] | None = None) -> list[dict]:
     """L relation steps -> L+1 searches: L to WALK the chain, one to READ the leaf.
 
     Query = the CURRENT (source) entity name + this hop's relation kw, i.e. search
@@ -482,9 +624,15 @@ def _build_route_oracle(steps: list[str], chain: list[dict], leaf_kw: str) -> li
     """
     plan = []
     for k in range(1, len(chain)):
-        _, _, _, _, kw = _REL[steps[k - 1]]
+        # `hop_kws` carries one phrasing realisation per hop (see
+        # _REL_QUERY_VARIANTS); falling back to the canonical keyword keeps every
+        # existing caller and every test that builds a plan by hand working.
+        kw = hop_kws[k - 1] if hop_kws else _REL[steps[k - 1]][4]
         plan.append({"name": "search", "arguments": {"query": f"{chain[k - 1]['name']} {kw}"}})
     plan.append({"name": "search", "arguments": {"query": f"{chain[-1]['name']} {leaf_kw}"}})
+    assert len(plan) == len(steps) + 1, (
+        f"an L-hop route must plan L+1 searches: route {steps} of length "
+        f"{len(steps)} produced {len(plan)}")
     return plan
 
 
@@ -505,20 +653,44 @@ def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: s
         # alone, so one leaky attribute must not cost us the whole chain.
         for attr_word, gold, answer, leaf_kw in _leaf_attr_options(rng, leaf):
             prompt = f"What is the {attr_word}of {phrase}?"
-            plan = _build_route_oracle(steps, chain, leaf_kw)
+            # Phrasing realisations come from their OWN stream, keyed on
+            # (seed, route, leaf attribute) -- see _variant_rng. Drawing them from
+            # `rng` would shift every subsequent draw and re-point the seed ranges.
+            vrng = _variant_rng(seed, steps, leaf_kw)
+            hop_kws = [vrng.choice(_REL_QUERY_VARIANTS[st]) for st in steps]
+            leaf_q = vrng.choice(_LEAF_QUERY_VARIANTS.get(leaf_kw, [leaf_kw]))
+            plan = _build_route_oracle(steps, chain, leaf_q, hop_kws)
             if filter_shortcuts:
-                # Two leaks, checked cheapest first. (a) one un-chained BM25
-                # `search` on the FULL question text already surfaces the gold
-                # answer (MuSiQue disconnection filtering); (b) the plan's own
-                # pre-terminal calls already surface it, so the chain can be
-                # truncated. Count the attempt regardless of outcome so both
-                # rejection rates stay observable.
+                # Four axes, checked cheapest first.
+                #   (a) one un-chained BM25 `search` on the FULL question text
+                #       already surfaces the gold answer (MuSiQue disconnection
+                #       filtering);
+                #   (b) the plan's own pre-terminal calls already surface it, so
+                #       the chain can be truncated and a model that stops early is
+                #       still scored right;
+                #   (c) a hop does not reveal the entity the NEXT hop is written
+                #       from, so the plan is only followable by someone who
+                #       already knows the answer to it;
+                #   (d) the terminal read does NOT surface the gold answer, so the
+                #       episode never shows the model its own answer.
+                # (a) and (b) are LEAKS, (c) and (d) are INSUFFICIENCY -- opposite
+                # failures, and a task has to clear all four. (b) and (c) share one
+                # replay of the pre-terminal calls; (d) costs one extra search.
+                # Count the attempt regardless of outcome so every rejection rate
+                # stays observable.
                 _SHORTCUT_STATS["checked"] += 1
                 if _is_shortcut_solvable(w, prompt, gold):
                     _SHORTCUT_STATS["rejected"] += 1
                     continue
-                if _is_prefix_leaky(w, plan, gold):
+                leaky, broken = _prefix_report(w, plan, chain, gold)
+                if leaky:
                     _SHORTCUT_STATS["prefix_rejected"] += 1
+                    continue
+                if broken:
+                    _SHORTCUT_STATS["broken_chain_rejected"] += 1
+                    continue
+                if _is_unretrievable(w, plan, gold):
+                    _SHORTCUT_STATS["unretrievable_rejected"] += 1
                     continue
             return Task(
                 task_id=_tid(task_type, seed), seed=seed, prompt=prompt,
@@ -528,6 +700,7 @@ def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: s
                 oracle_plan=plan,
                 oracle_answer=answer,
                 route=list(steps),
+                chain=[c["name"] for c in chain],
                 notes=f"{hops}-hop retrieval chain; {len(plan)} dependent searches "
                       f"({hops} to walk the chain + 1 terminal read of the leaf passage)")
     return None

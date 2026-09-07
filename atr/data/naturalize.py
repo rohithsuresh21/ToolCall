@@ -121,18 +121,41 @@ def naturalize_passage(passage: dict, llm_client) -> dict:
 
     Only `text` (and the `title`) may be touched; `facts` and everything else are
     returned unchanged so scoring never reads naturalized prose."""
+    out, _attempts = naturalize_passage_with_attempts(passage, llm_client)
+    return out
+
+
+def naturalize_passage_with_attempts(passage: dict, llm_client) -> tuple[dict, int]:
+    """`naturalize_passage`, plus how many LLM calls it took.
+
+    The attempt count has to come out of HERE, because here is the only place that
+    knows it -- and both aggregators below initialised `stats["retries"] = 0` and
+    then had nothing to increment it with, so every naturalization run ever made
+    reported exactly 0 retries. That reads as a clean result and was an unwired
+    counter. It matters at mint time: retries are LLM calls spent on rewrites that
+    failed the fact check, and across ~54,000 passages the difference between a
+    1.0x and a 2.5x attempt ratio is the difference between a 15-hour job and a
+    30-hour one -- which is the number the decision to mint at all depends on.
+
+    It is returned ALONGSIDE the passage rather than stored in it: the passage dict
+    becomes a `world.documents` entry, `naturalize_passage` is contractually
+    allowed to touch only `text` and `naturalized`, and `test_naturalize.py`
+    asserts exactly that. Telemetry does not belong in the corpus.
+    """
     out = dict(passage)
     original = passage.get("text", "")
+    attempts = 0
     for _ in range(_MAX_RETRIES):
+        attempts += 1
         new_text = _call_llm(llm_client, _build_prompt(passage)).strip() or original
         if _facts_present(passage, new_text):
             out["text"] = new_text
             out["naturalized"] = True
-            return out
+            return out, attempts
     # exhausted retries: ship the known-good templated text rather than a broken one
     out["text"] = original
     out["naturalized"] = False
-    return out
+    return out, attempts
 
 
 def naturalize_passages(world, llm_client) -> dict:
@@ -144,7 +167,9 @@ def naturalize_passages(world, llm_client) -> dict:
         if not d.get("text"):
             continue
         before = d["text"]
-        nd = naturalize_passage(d, llm_client)
+        nd, attempts = naturalize_passage_with_attempts(d, llm_client)
+        # attempts-1: the first call is the attempt, everything after it a retry.
+        stats["retries"] += max(0, attempts - 1)
         if nd["text"] != before:
             stats["naturalized"] += 1
             if nd.get("naturalized") is False:
@@ -169,7 +194,9 @@ def naturalize_selected(world, selected: set[str], llm_client) -> dict:
         if not d.get("text"):
             continue
         before = d["text"]
-        nd = naturalize_passage(d, llm_client)
+        nd, attempts = naturalize_passage_with_attempts(d, llm_client)
+        # attempts-1: the first call is the attempt, everything after it a retry.
+        stats["retries"] += max(0, attempts - 1)
         if nd["text"] != before:
             stats["naturalized"] += 1
             if nd.get("naturalized") is False:

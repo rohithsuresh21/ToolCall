@@ -67,17 +67,32 @@ def _key_args_match(oracle_args: dict, got_args: dict) -> bool:
 # ---------------------------------------------------------------------------
 # per-hop diagnostics (dense shaping signal for the multi-hop collapse)
 # ---------------------------------------------------------------------------
-# Every oracle search query is "<Entity Name...> <relation keyword>", e.g.
-# "Luca Alvarez author". The relation keyword is a lowercase single word; the
-# entity is the leading capitalized name. We keep the anchor check anchored to
-# the REAL head entity of the oracle chain -- not just "some phrase from the
-# prompt" -- so echoing the whole question is never rewarded.
-_ORACLE_QUERY_ENT = re.compile(r"^((?:[A-Z][A-Za-z0-9']*\s?)+)")
+# Every oracle search query names an entity and a relation, e.g. "Luca Alvarez
+# author". We keep the anchor check anchored to the REAL head entity of the oracle
+# chain -- not just "some phrase from the prompt" -- so echoing the whole question
+# is never rewarded.
+#
+# The entity is NOT reliably the leading token. Oracle queries carry varied
+# phrasing realisations (generator._REL_QUERY_VARIANTS), several of which lead
+# with a capitalised function word -- "Which country contains Meridian City",
+# "In what year was Vertex Dynamics founded". An anchored ^ match returned that
+# leading word, or the empty string when the phrasing led with lowercase: 895 of
+# 2354 plan queries resolved to "" once the realisations were varied, silently
+# zeroing the anchor and progress terms for the episodes that used them. So we
+# SEARCH for every capitalised run and take the longest -- entity names here are
+# 1-3 words ("Khaldonia", "Meridian City", "The Hollow Star") while the function
+# words that survive capitalisation are one.
+_ORACLE_QUERY_ENT = re.compile(r"[A-Z][A-Za-z0-9']*(?:\s+[A-Z][A-Za-z0-9']*)*")
 
 
 def _oracle_entity(query: str) -> str:
-    m = _ORACLE_QUERY_ENT.match(query or "")
-    return m.group(1).strip().lower() if m else ""
+    """Longest capitalised run in the query, lowercased. "" when there is none."""
+    runs = _ORACLE_QUERY_ENT.findall(query or "")
+    if not runs:
+        return ""
+    # Word count first, character length as the tie-break: "Meridian City" beats
+    # "Which", and "The Hollow Star" beats "In".
+    return max(runs, key=lambda r: (len(r.split()), len(r))).strip().lower()
 
 
 def _search_queries(task: Task, traj: Trajectory) -> list[str]:

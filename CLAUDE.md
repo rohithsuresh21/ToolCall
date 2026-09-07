@@ -108,7 +108,7 @@ world marker, so it would train a format the model never sees at eval.
 unretrieved answer, conflicting labels, prefix leakage) and works on any jsonl, including one
 built elsewhere. It exits non-zero when any of them is present.
 
-**The shortcut filter has two axes, and the single-search one only sees the first.**
+**The candidate filter has four axes; the single-search one only sees the first.**
 `_is_shortcut_solvable` is MuSiQue disconnection filtering: fire ONE `search` on the full
 question and reject if the gold answer comes back. That catches the chain that collapses to a
 single query, and nothing else. The other leak is per-hop: BM25 returns whole passages and
@@ -119,6 +119,26 @@ and that is what it learns. Measured on unfiltered chains: **51.9% of 4-hop and 
 minority of those were visible to the single-search test. `_is_prefix_leaky` replays the plan's
 own pre-terminal calls and rejects on any hit; after it, all three families sit at 0%.
 
+Those two axes are LEAKS. The other two are the opposite defect — INSUFFICIENCY, a task whose
+own oracle plan cannot reach what it needs — and both only became possible once the passage
+prose stopped restating each fact in the words the question asks it in (see the unanchored
+templates below). `_is_unretrievable` replays the TERMINAL read and rejects when the gold
+answer is not in it: the episode would never show the model its own answer. `_prefix_report`
+returns `broken` when a hop does not reveal the entity the NEXT hop's query is written from,
+which makes the plan followable only by someone who already knows that name — the
+psychic-query defect, re-entering through retrieval rather than through an off-by-one.
+`_prefix_report` computes the prefix-leak and broken-chain axes from ONE replay of the
+pre-terminal calls, so the four axes together cost one extra search per candidate over the two.
+Rejection counts live in `_SHORTCUT_STATS` under four separate keys, because a single total
+cannot tell a leak from an insufficiency.
+
+Both insufficiency axes are RARE and neither is optional. Over 1500 seeds the retrievability
+gate fires on ~1 in 8600 raw candidates — `tests/test_shortcut_filter.py` pins the known
+reproduction (seed 735) rather than checking a rate, because a gate that rare is
+indistinguishable from dead code under any sampling test. The broken-chain axis fires on ~2 in
+600 built tasks. Without them `assert_answer_retrievable` is the only defence, and it runs only
+AFTER a build.
+
 Two things make it cheap. Leakiness is a property of **(route, attribute)**, not of the route —
 a country's population leaks through its capital's passage (same number by construction), its
 official language does not — so `gen_musique` walks the leaf's other terminal attributes before
@@ -128,6 +148,75 @@ cost lands on the *build*, where the surviving questions are less varied and `de
 drops more (6000 seeds: 2457 → 1951 records, −20.6%, mix still exactly 40/30/30). The dev pool
 has one route per length, so 12–28% of dev seeds become unmintable; `dev_set` retries seeds, so
 the dev set still fills.
+
+**Passage prose is UNANCHORED, and the oracle's queries are too.** Both used to hold exactly
+one realisation. `_passage` stated every fact in the words the question would ask it in —
+"The official language is X", "was founded in Y" — so the leaf keyword in the oracle's
+terminal query was guaranteed to be a literal term in the passage that OWNED the answer, and
+BM25 found it whatever else was in the corpus. And `_REL[k][4]` gave each relation one fixed
+query string, so the oracle plan taught a lookup table keyed on the question template
+("<Entity> capital", "<Entity> author") — a surface form the real judge questions never use.
+Together that is a large part of the synthetic-to-real gap: 100% on synthetic 2-hop against
+46.4% on the real 2-hop rows. Now `world._PASSAGE_TEMPLATES` holds three renderings per entity
+kind, picked by a hash of (seed, doc_id), and `generator._REL_QUERY_VARIANTS` /
+`_LEAF_QUERY_VARIANTS` hold three per relation and per leaf attribute.
+
+**Unanchoring makes siblings outrank the passage that owns the fact, which is the point.**
+Traced live: "Khaldonia official language" scored Vestorland 4.66, Caldury 4.57, Orinella 4.57
+and Khaldonia — which owns the answer — only 4.25, because those three kept the literal
+keyword and Khaldonia's realisation did not; at `top_k=3` the right passage is dropped. The
+same mechanism runs the other way on hops: the city realisation "X serves as the seat of
+government of Y" puts that phrase in six CITY passages, so the walk query "<Country> seat of
+government" comes back with three unrelated cities and never names the country's own capital.
+That is exactly what real Wikipedia does to a retriever, so the response is to GENERATE
+AGAINST IT rather than anchor around it — the two insufficiency axes above are what keep the
+unreachable tasks out. Anchoring the keyword back into the templates would also produce a
+clean build, and was rejected: it buys that by removing the retrieval problem the model is
+supposed to learn.
+
+Two invariants every realisation must hold, or gold answers and hops break: every attribute
+VALUE appears verbatim in the same formatting (a population keeps its comma grouping —
+`norm_text` strips punctuation consistently, but only if both sides were written the same
+way), and every LINKED ENTITY NAME still appears, because walking a chain means reading the
+next entity's name out of the current passage. Only the framing words vary.
+
+**Phrasing is drawn from `_variant_rng`, never from the generator's own `rng`.** Keyed on
+(seed, route, leaf attribute). Drawing it from `rng` would consume from the stream that picks
+routes, resolves chains and orders leaf attributes, so every seed would mint a DIFFERENT task
+than before — silently re-pointing the SFT/dev/GRPO seed ranges the whole no-leakage argument
+rests on. Verified: with the filters off, 900 candidates over 300 seeds are byte-identical to
+the pre-change generator in prompt, gold, route and answer, and differ only in query strings.
+With the filters ON, 55/600 tasks legitimately differ — a leaky attribute under one phrasing
+is not leaky under another, so the filters accept a different candidate. That is the filters
+re-evaluating, not the stream shifting.
+
+**`Task.chain` records what `route` resolved to.** `route` is the relation names; `chain` is
+the entity names they landed on, `len(route) + 1` of them. It is recorded rather than
+recomputed because `_resolve_chain` draws from the generator's `rng`: re-resolving the same
+route on a fresh `Random` lands on different entities, so whether each hop reveals the next one
+is not checkable after the fact without it. `_plan_shape` in `test_shortcut_filter.py` carries
+the same lesson — it used to RECONSTRUCT the route by mapping each query's last word back
+through `_REL[k][4]`, which worked only while every relation had one realisation; once
+phrasings varied, 564/600 tasks became unresolvable and the tests would have failed on the
+reconstruction rather than on the property they exist to check. It reads `task.route` now, and
+asserts `len(oracle_plan) == len(route) + 1`.
+
+**`_oracle_entity` searches for the longest capitalised run; it must not anchor at `^`.**
+`verifiers._hop_diagnostics` anchors the per-hop reward shaping on the oracle chain's real head
+entity. The old regex assumed the entity always led the query. Varied realisations break that:
+some lead with a capitalised function word ("Which country contains Meridian City"), some with
+lowercase, and 895 of 2354 plan queries resolved to `""` — silently zeroing `w_anchor` and
+`w_progress` for every episode that used them. Entity names here run 1-3 words and the
+surviving function words are one, so the longest capitalised run is the entity.
+
+**`w_args_strict` is 0.0.** It scored the model's query string against the ORACLE'S EXACT
+string — already a weak proxy, and pure noise once the oracle draws one of three realisations
+per relation, since an identically good query matches the drawn one about a third of the time
+on a coin flip the policy cannot observe. TIER and Search-R1 both report that rewarding
+intermediate retrieval form does not help beyond the outcome signal. `args_strict_frac` is
+still COMPUTED and still reported by eval — it reads how far the policy has drifted from the
+reference phrasing — it just no longer moves the gradient. Do not re-weight it without
+re-fixing the oracle to a single phrasing first.
 
 **Retrieval checks read parsed `title` + `text`, never the raw tool_response string.** The
 rendered block also carries `doc_id` and the BM25 `score` float, and `norm_text` deletes
@@ -311,7 +400,18 @@ prose via an LLM under fact-preservation checks and writes a cache keyed `"seed:
 `naturalize_retrieved_local` against a local Ollama), then loaded via `--cache <path>` →
 `load_naturalized_loader()` → `build_world(seed, text_loader=...)`. Entities, attributes and
 gold answers are unaffected by design; `test_naturalize.py` and `verify_naturalize_live.py`
-assert that isolation.
+assert that isolation. `naturalize_passage_with_attempts` is the form that reports how many
+LLM calls a rewrite took; `naturalize_passage` keeps the narrower contract (it may touch only
+`text` and `naturalized`, which `test_naturalize.py` asserts), so the attempt count is returned
+ALONGSIDE the passage rather than stored in it — telemetry does not belong in the corpus.
+Both aggregators used to initialise `stats["retries"] = 0` with nothing to increment it, so
+every run ever made reported exactly 0 retries: a number that read as a clean result and was an
+unwired counter. It decides whether minting is affordable at all — across ~54,000 passages a
+1.0x versus 2.5x attempt ratio is a 15-hour job versus a 30-hour one.
+
+Any cache minted before the unanchored templates is STALE. It is keyed `"seed:doc_id"` and
+those keys still resolve, so it would load silently and paste old-template prose over the new
+realisations, undoing the change with no error anywhere.
 
 ## Conventions
 
