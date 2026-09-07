@@ -3,3 +3,5 @@ artifacts/*
 archive/*
 __pycache__/
 *.pyc
+scripts/pulled 2/
+pulled/
