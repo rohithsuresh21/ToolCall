@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from atr.agent.backends import HFBackend, SamplingParams
+from atr.agent.backends import SamplingParams, load_backend
 from atr.agent.loop import Step, Trajectory
 from atr.agent.parser import parse_turn
 from atr.agent.prompt import build_messages
@@ -188,6 +188,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="Qwen/Qwen3-1.7B")
     ap.add_argument("--adapter", default=None)
+    ap.add_argument("--backend", default=None, help="vllm:<model> (default: vllm:<base>)")
     ap.add_argument("--tasks", default="data/judge_tasks.jsonl")
     ap.add_argument("--out", default="artifacts/judge_eval")
     ap.add_argument("--name", default=None, help="label used in the report header")
@@ -223,7 +224,7 @@ def main() -> None:
     }
     print(f"[frozen] temperature={cfg['temperature']} top_p={cfg['top_p']} "
           f"max_new_tokens={cfg['max_new_tokens']} max_steps={cfg['max_steps']}")
-    backend = HFBackend(args.base, adapter=args.adapter)
+    backend = load_backend(args.backend or f"vllm:{args.base}", adapter=args.adapter)
     name = (args.name if args.name else
             (("base-" + Path(args.adapter).name) if args.adapter else "BASE"))
     evaluate(recs, backend, cfg, args.batch_size, name, Path(args.out))
