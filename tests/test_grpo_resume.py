@@ -87,7 +87,7 @@ def make_trainer(cfg: GRPOConfig, step_cost: float = 0.0) -> GRPOTrainer:
     card = ScoreCard(task_id="x", task_type="musique_2hop", difficulty=2, num_calls=3)
     rec = {"reward": 1.0, "card": card}
 
-    def fake_collect_batch():
+    def fake_collect_batch(step=0):
         # a real optimiser step, so the moments in trainer_state.pt are non-trivial
         loss = t.model(torch.ones(1, 4)).sum()
         t.opt.zero_grad()
@@ -95,7 +95,8 @@ def make_trainer(cfg: GRPOConfig, step_cost: float = 0.0) -> GRPOTrainer:
         t.opt.step()
         if step_cost:
             _time.sleep(step_cost)
-        return [rec], {"sampled_groups": 4, "discarded_groups": 1}
+        return [rec], {"sampled_groups": 4, "discarded_groups": 1,
+                       "discard_reasons": {"zero_variance": 1}}
 
     t.collect_batch = fake_collect_batch
     t.assign_advantages = lambda recs: {"n_groups": 1, "dead_groups": 0,

@@ -116,6 +116,25 @@ class GRPOConfig:
     void_turn_filter: bool = True         # SimpleTIR: drop episodes with a no-op turn
     log_entropy: bool = True              # per-token action entropy; disable if it OOMs
 
+    # --- rollout forensics ----------------------------------------------------
+    # An all-discarded step logs every quality metric as 0.0 -- not because the
+    # policy scored zero but because `collect_batch` returned an EMPTY pool and
+    # the row is a mean over nothing. That makes "the model failed" and "the
+    # filter ate everything" the same log line, which is the state this repo was
+    # debugged from. These two knobs separate them.
+    #
+    # `dump_rollouts` writes the first N episodes of each step's FIRST generation
+    # batch to <out_dir>/rollouts/step-<N>.jsonl: the raw assistant text exactly
+    # as the backend returned it, the parse outcome, the tool calls, the reward
+    # parts and the discard reason. Raw text is the only thing that distinguishes
+    # a formatting collapse from a retrieval failure; statistics cannot.
+    dump_rollouts: int = 0                # 0 = off; 4-8 is enough to read a step
+    # Rollout-quality metrics in history.jsonl are computed over every SAMPLED
+    # episode rather than over the surviving pool. With dynamic sampling the pool
+    # is a filtered, non-representative subset, and when it is empty the pool
+    # numbers are structurally 0.0.
+    log_sampled_stats: bool = True
+
     # --- curriculum ---
     task_mix: dict = field(default_factory=lambda: dict(DEFAULT_MIX))
     curriculum: bool = True               # stage difficulty easy -> default -> hard
@@ -631,14 +650,31 @@ class GRPOTrainer:
                 if any(abs(x) > 1e-8 for x in ta):
                     live_group = True
             r_live = live_group
+            # Why a surviving group still carries no gradient. `group_advantages`
+            # returns all-zeros when the within-group reward std is < 1e-4, so a
+            # group dies from lack of DISAGREEMENT, not from low reward -- eight
+            # identical failures and eight identical successes are both dead.
+            # `void_singleton` is the one worth watching: the void filter drops
+            # episodes BEFORE the group is formed, so a group reduced to a single
+            # survivor has zero variance by arithmetic and can never be live,
+            # however good that survivor was.
+            reason = None
+            if not r_live:
+                dead += 1
+                if len(rs) < 2:
+                    reason = "void_singleton"
+                elif not any(abs(x) > 1e-8 for x in ep):
+                    reason = "zero_variance"
+                else:
+                    reason = "no_turn_advantage"
             for r in rs:
                 r["live"] = r_live
-            if not live_group:
-                dead += 1
+                r["dead_reason"] = reason
 
             # Diagnostic group stats for reading a run (not used by any decision).
             group_stats.append({"group": gid, "n": len(rs), "mean_reward": round(mean_rewards[gi], 4),
-                                "dqw_weight": round(w, 4), "live": bool(r_live)})
+                                "dqw_weight": round(w, 4), "live": bool(r_live),
+                                "dead_reason": reason})
 
         self._last_group_stats = group_stats
         return {"n_groups": len(groups), "dead_groups": dead,
@@ -777,17 +813,29 @@ class GRPOTrainer:
         return stats
 
     # -- 6. driver -------------------------------------------------------
-    def collect_batch(self) -> tuple[list[dict], dict]:
+    def collect_batch(self, step: int = 0) -> tuple[list[dict], dict]:
         """F4 dynamic sampling: refill until enough live groups or the cap hits."""
         target = self.cfg.tasks_per_step
         pool: list[dict] = []
         seen: set[str] = set()
         gen_batches, discarded, total_groups = 0, 0, 0
+        # Every discarded group is counted under the reason it died, so an
+        # all-discarded step says WHICH filter ate it. Without this, a step that
+        # threw away 72/72 groups is indistinguishable from a step where the
+        # policy simply scored zero: both log the same all-zero row.
+        reasons: dict[str, int] = {}
+        sampled: list[dict] = []              # every episode rolled out this step
+        n_episodes = 0
         while gen_batches < max(1, self.cfg.max_gen_batches):
             n = target * (self.cfg.batch_multiplier if gen_batches == 0 else 2)
             tasks = self.sample_tasks(min(n, self.cfg.seed_span))
             records = self.rollout(tasks)
             self.assign_advantages(records)
+            n_episodes += len(records)
+            if self.cfg.log_sampled_stats:
+                sampled.extend(records)
+            if gen_batches == 0 and self.cfg.dump_rollouts:
+                self._dump_rollouts(records, step)
             fresh = []
             for gid in dict.fromkeys(r["group"] for r in records):
                 total_groups += 1                 # every sampled group counts here
@@ -797,6 +845,13 @@ class GRPOTrainer:
                         fresh.append(grp)
                 else:
                     discarded += 1
+                    # A group whose every episode was voided never reaches the
+                    # groups dict in assign_advantages at all, so it carries no
+                    # dead_reason and has to be classified here.
+                    why = next((r["dead_reason"] for r in grp if r.get("dead_reason")), None)
+                    if why is None:
+                        why = "all_void" if all(r["void"] for r in grp) else "unknown"
+                    reasons[why] = reasons.get(why, 0) + 1
             for grp in fresh:
                 if len(seen) >= target:
                     break
@@ -809,8 +864,95 @@ class GRPOTrainer:
         # This is the signal that must feed curriculum_feedback, not the (near-zero)
         # fraction recomputed inside the already-filtered pool.
         info = {"gen_batches": gen_batches, "discarded_groups": discarded,
-                "live_groups": len(seen), "sampled_groups": total_groups}
+                "live_groups": len(seen), "sampled_groups": total_groups,
+                "rollout_episodes": n_episodes,
+                "discard_reasons": {k: reasons[k] for k in sorted(reasons)}}
+        if self.cfg.log_sampled_stats:
+            info.update(self._sampled_stats(sampled))
         return pool, info
+
+    @staticmethod
+    def _sampled_stats(sampled: list[dict]) -> dict:
+        """Policy quality over every SAMPLED episode, not the surviving pool.
+
+        The pool is whatever dynamic sampling kept; when it is empty the headline
+        row is a mean over nothing and reads as a total policy failure. These
+        `smp_*` fields are measured before any filter, so they still describe the
+        model on a step where every group was discarded."""
+        if not sampled:
+            return {}
+        n = len(sampled)
+        stop: dict[str, int] = {}
+        for r in sampled:
+            k = r["traj"].stop_reason
+            stop[k] = stop.get(k, 0) + 1
+        rw = [r["reward"] for r in sampled]
+        return {
+            "smp_n": n,
+            "smp_reward_mean": round(statistics.fmean(rw), 4),
+            "smp_reward_std": round(statistics.pstdev(rw), 4) if n > 1 else 0.0,
+            "smp_final_f1": round(statistics.fmean([r["card"].final_f1 for r in sampled]), 4),
+            "smp_success": round(sum(bool(r["card"].success) for r in sampled) / n, 4),
+            "smp_format_strict": round(sum(bool(r["card"].format_strict) for r in sampled) / n, 4),
+            "smp_avg_calls": round(statistics.fmean([r["card"].num_calls for r in sampled]), 2),
+            "smp_void_frac": round(sum(bool(r["void"]) for r in sampled) / n, 4),
+            "smp_truncated_frac": round(
+                sum(bool(r["card"].detail.get("truncated")) for r in sampled) / n, 4),
+            "smp_stop_reasons": {k: stop[k] for k in sorted(stop)},
+        }
+
+    def _dump_rollouts(self, records: list[dict], step: int) -> None:
+        """Write the raw generated text of the first N episodes of this step.
+
+        Statistics cannot tell a formatting collapse from a retrieval failure; the
+        generated string can. This is deliberately the text exactly as the backend
+        returned it -- no repair, no canonicalisation -- because the parser is
+        lenient and what it recovers is not what the model emitted."""
+        out = Path(self.cfg.out_dir) / "rollouts"
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"step-{step}.jsonl"
+        rows = []
+        for r in records[: max(0, self.cfg.dump_rollouts)]:
+            j = r["traj"]
+            rows.append({
+                "step": step,
+                "task_id": j.task_id,
+                "group": r["group"],
+                "task_type": r["task"].task_type,
+                "difficulty": r["task"].difficulty,
+                "question": j.prompt,
+                "gold": r["task"].gold,
+                "oracle_plan_len": len(r["task"].oracle_plan),
+                "stop_reason": j.stop_reason,
+                "void": bool(r["void"]),
+                "final_answer": j.final_answer,
+                "reward": round(r["reward"], 4),
+                "reward_parts": {k: round(v, 4) for k, v in r["parts"].items()},
+                "final_f1": r["card"].final_f1,
+                "success": bool(r["card"].success),
+                "format_strict": bool(r["card"].format_strict),
+                "truncated": bool(r["card"].detail.get("truncated")),
+                "failure_mode": r["card"].failure_mode,
+                "dead_reason": r.get("dead_reason"),
+                "live": bool(r.get("live")),
+                "turns": [
+                    {
+                        "index": s.index,
+                        "raw_assistant_text": s.assistant_text,
+                        "n_chars": len(s.assistant_text),
+                        "parse_errors": s.parse_errors,
+                        "strict_format": s.strict_format,
+                        "tool_calls": s.tool_calls,
+                        "tool_result_preview": [
+                            json.dumps(x, default=str)[:400] for x in s.tool_results],
+                    }
+                    for s in j.steps
+                ],
+            })
+        with path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        print(f"[grpo] dumped {len(rows)} raw rollouts -> {path}", flush=True)
 
     @staticmethod
     def canary_accept(cand: dict, best: dict | None) -> bool:
@@ -898,7 +1040,7 @@ class GRPOTrainer:
                     stopped_early = True
                     break
             t0 = time.time()
-            records, dinfo = self.collect_batch()
+            records, dinfo = self.collect_batch(step)
             ginfo = self.assign_advantages(records)     # idempotent; refresh stats
             items = self.encode(records)
             ostats = self.optimise(items)
@@ -927,6 +1069,13 @@ class GRPOTrainer:
             pulled_back = (feedback and dg_mean > self.cfg.dead_group_threshold)
 
             rewards = [r["reward"] for r in records] or [0.0]
+            # An empty pool means dynamic sampling discarded every group. The
+            # `reward_mean`/`success`/`final_f1`/... fields below are then means
+            # over an empty list -- structurally 0.0, not measurements of the
+            # policy. Flag that explicitly so the row cannot be read as "the
+            # model scored zero", and read the smp_* fields instead: they are
+            # computed over every sampled episode, before any filter.
+            pool_empty = not records
             # Plan B diagnostics: the group composition actually trained on.
             gstats = getattr(self, "_last_group_stats", [])
             row = {
@@ -954,7 +1103,20 @@ class GRPOTrainer:
                 "grp_dqw": [g["dqw_weight"] for g in gstats],
                 "dead_group_rolling_mean": round(dg_mean, 4),
                 "curriculum_pulled_back": bool(pulled_back),
+                # True when every quality field above is a mean over an empty
+                # pool. The smp_* fields carry the real policy numbers.
+                "pool_empty": bool(pool_empty),
             }
+            if pool_empty:
+                print(f"[grpo] WARNING step {step}: all "
+                      f"{dinfo.get('sampled_groups', 0)} sampled groups discarded -> "
+                      f"NOTHING TRAINED. reasons={dinfo.get('discard_reasons', {})} "
+                      f"| policy on sampled episodes: "
+                      f"f1={dinfo.get('smp_final_f1')} "
+                      f"format_strict={dinfo.get('smp_format_strict')} "
+                      f"void={dinfo.get('smp_void_frac')} "
+                      f"reward_std={dinfo.get('smp_reward_std')} "
+                      f"stop={dinfo.get('smp_stop_reasons')}", flush=True)
             if self.cfg.eval_every and step % self.cfg.eval_every == 0:
                 row.update(self.run_dev_canary())
                 print(f"[grpo] canary step {step}: dev_f1={row['dev_f1']} "
