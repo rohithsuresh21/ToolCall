@@ -210,6 +210,13 @@ class GRPOConfig:
     max_seconds: int = 0                  # 0 = no limit. Otherwise stop cleanly and
                                           # save once THIS session's wall clock would
                                           # not fit another step. 3h30m = 12600.
+    stop_file: str | None = None          # optional per-step stop signal. When this file
+                                          # appears, the trainer saves a checkpoint at the
+                                          # CURRENT step (step-N + final) and exits cleanly
+                                          # so the pipeline can archive the weights. Touch
+                                          # it (e.g. `touch $PWD/artifacts/grpo-real/STOP`)
+                                          # from another shell to stop whenever you want.
+                                          # Default derived at runtime as <out_dir>/STOP.
 
 
 # ---------------------------------------------------------------------------
@@ -1118,7 +1125,20 @@ class GRPOTrainer:
         if budget:
             print(f"[grpo] wall-clock budget {budget}s for this session", flush=True)
 
+        stop = Path(self.cfg.stop_file) if self.cfg.stop_file else (out / "STOP")
+        stop_hit = False
+
         for step in range(self.start_step + 1, self.cfg.steps + 1):
+            if stop.exists():
+                try:
+                    stop.unlink()
+                except OSError:
+                    pass
+                stop_hit = True
+                print(f"[grpo] stop signal {stop} found - saving at step {last_done} "
+                      f"then exiting", flush=True)
+                stopped_early = True
+                break
             # Check the budget BEFORE starting a step, not after. A step costs on the
             # order of a hundred seconds and the reservation does not care that we
             # were mid-optimise: stopping one step short and saving beats being
@@ -1241,9 +1261,14 @@ class GRPOTrainer:
 
         # `final` is a full resume point too, so a wall-clock stop loses nothing.
         self._save_checkpoint(out / "final", last_done)
-        head = (f"[grpo] STOPPED EARLY at step {last_done}/{self.cfg.steps} on the "
-                f"{budget}s wall-clock budget" if stopped_early
-                else f"[grpo] done at step {last_done}/{self.cfg.steps}")
+        if stop_hit:
+            head = (f"[grpo] STOPPED EARLY at step {last_done}/{self.cfg.steps} "
+                    f"on the {stop} stop signal")
+        elif stopped_early:
+            head = (f"[grpo] STOPPED EARLY at step {last_done}/{self.cfg.steps} on the "
+                    f"{budget}s wall-clock budget")
+        else:
+            head = f"[grpo] done at step {last_done}/{self.cfg.steps}"
         print(f"{head} -> {out / 'final'}")
         if stopped_early:
             print("[grpo] continue the run with:")

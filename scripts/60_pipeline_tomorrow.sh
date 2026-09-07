@@ -68,6 +68,8 @@ echo ""
 
 # ------------------------------------------------ 2. TRAIN GRPO (50, FIXED) --
 echo "===== [2] GRPO   steps=$STEPS   with 4-hop fix (lambda=0 + under-call ON) ====="
+echo "  NOTE: save_every=5 -> durable checkpoint every 5 steps; touch $OUT/STOP"
+echo "  at ANY time to save at the current step and archive+eval immediately."
 python3 -m atr.train.grpo \
   --model-id "$MODEL" \
   --adapter "$ADAPTER" \
@@ -75,12 +77,19 @@ python3 -m atr.train.grpo \
   --group-size 8 --tasks-per-step 10 --steps "$STEPS" \
   --lr 2e-5 --temperature 1.0 --kl-beta 0.03 --micro-batch 2 \
   --curriculum true --void-turn-filter true --eval-every 50 \
-  --log-every 5 \
+  --log-every 5 --save-every 5 \
   --dead-frac-source discarded --advantage-scale mad --advantage-baseline sign --sign-baseline 0.5 \
   --dqw true --dqw-temp 2.2 --e2h-curriculum true \
   --efficiency-lambda 0.0 --under-call-penalty true \
   --real-tasks-path "$REAL_TASKS" --real-fraction "$REAL_MIX"
 [[ -d "$OUT" ]] || { echo "FATAL: GRPO produced no adapter"; exit 1; }
+# The trainer keeps the last adapter at <out>/final/{adapter,tokenizer,trainer_state}.
+# The evals below read ADAPTER="$OUT", so promote final/ into the out-dir root when
+# present (works for NATURAL completion and for the STOP-signal early exit).
+if [[ -d "$OUT/final" ]]; then
+  echo "  promoting $OUT/final -> $OUT (evals read ADAPTER=$OUT)"
+  cp -r "$OUT"/final/. "$OUT"/
+fi
 echo ""
 
 # -------------------------------------------------- archiving GRPO weights ----
