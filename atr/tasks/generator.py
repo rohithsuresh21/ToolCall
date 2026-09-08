@@ -653,12 +653,34 @@ def gen_musique(w: World, rng: random.Random, seed: int, hops: int, task_type: s
         # alone, so one leaky attribute must not cost us the whole chain.
         for attr_word, gold, answer, leaf_kw in _leaf_attr_options(rng, leaf):
             prompt = f"What is the {attr_word}of {phrase}?"
-            # Phrasing realisations come from their OWN stream, keyed on
-            # (seed, route, leaf attribute) -- see _variant_rng. Drawing them from
-            # `rng` would shift every subsequent draw and re-point the seed ranges.
-            vrng = _variant_rng(seed, steps, leaf_kw)
-            hop_kws = [vrng.choice(_REL_QUERY_VARIANTS[st]) for st in steps]
-            leaf_q = vrng.choice(_LEAF_QUERY_VARIANTS.get(leaf_kw, [leaf_kw]))
+            # CANONICAL query phrasing: index 0 of each variant table, which is
+            # the canonical keyword by construction (index 0 == _REL[st][4] for
+            # every relation, and == the key for every leaf attribute).
+            #
+            # The three-realisation draw was reverted here after it was measured,
+            # not assumed, to cost F1: the v2 set (unanchored passages AND varied
+            # queries together) scored 21.4% on the 54 real judge rows against
+            # 30.2% for v1, with 3-hop collapsing 27.8% -> 9.7% and exact match to
+            # 0%, while the base model rechecked at exactly 5.1% -- so the eval
+            # path was unchanged and the regression was real. The model searched
+            # MORE and answered WORSE (3-hop calls 4.39 -> 5.50), which is what a
+            # reference plan that varies its query wording per task looks like from
+            # the policy's side: the same hop is asked for in three different ways
+            # across otherwise identical episodes, so query form carries no
+            # learnable signal and the model probes instead of committing.
+            #
+            # The UNANCHORED PASSAGE TEMPLATES stay (world._PASSAGE_TEMPLATES) --
+            # v2 changed both at once, so this isolates the query half. If 3-hop
+            # does not recover, the passage half is the remaining suspect.
+            #
+            # `_variant_rng` is deliberately KEPT (tests/test_shortcut_filter.py
+            # imports it, and it is the revert path) but is no longer called from
+            # here: it drew from its OWN stream, so removing the call does not
+            # shift the generator's `rng` and does not re-point the SFT/dev/GRPO
+            # seed ranges. Restoring variation means restoring the two
+            # `vrng.choice(...)` lines; do not delete the tables or the stream.
+            hop_kws = [_REL_QUERY_VARIANTS[st][0] for st in steps]
+            leaf_q = _LEAF_QUERY_VARIANTS.get(leaf_kw, [leaf_kw])[0]
             plan = _build_route_oracle(steps, chain, leaf_q, hop_kws)
             if filter_shortcuts:
                 # Four axes, checked cheapest first.

@@ -356,13 +356,23 @@ def test_no_generated_task_has_a_broken_chain():
     assert not bad, f"FAIL: {len(bad)}/{checked} tasks have an unfollowable hop: {bad[:5]}"
 
 
-def test_oracle_query_phrasing_actually_varies():
-    """The oracle plan must not emit one fixed string per relation.
+def test_oracle_query_phrasing_is_canonical():
+    """The variant TABLES stay populated, and the oracle plan draws index 0 only.
 
-    A single realisation per relation trains a lookup table keyed on the question
-    template -- "<Entity> capital", "<Entity> author" -- which is a surface form
-    the real judge questions never use. Both tables must contribute: a relation
-    whose variants list collapsed to one entry would pass a global count."""
+    v3 reverted the oracle to canonical phrasing: v2 varied passage prose AND
+    query phrasing together and lost F1 on the real judge rows (30.2% -> 21.4%,
+    3-hop 27.8% -> 9.7%), so this isolates the query half while the unanchored
+    passages stay. The tables are KEPT populated because restoring variation is
+    meant to be a one-line change -- a collapsed table would make that revert
+    silently a no-op.
+
+    The plan-side half of this check used to count
+    `query.split(" ", 1)[-1]` and assert >= 15 distinct values. That never
+    measured phrasing: entity names are multi-word, so it was counting
+    "Aeronautics field", "Alvarez born" -- name fragments. It reported 89
+    distinct "phrasings" under canonical-only phrasing, where there are exactly
+    13 keywords, so it would have passed vacuously through this change instead of
+    catching it. It asserts the canonical property directly now."""
     for table, label in ((_REL_QUERY_VARIANTS, "relation"), (_LEAF_QUERY_VARIANTS, "leaf")):
         for key, variants in table.items():
             assert len(variants) >= 2, f"FAIL: {label} {key} has only {len(variants)} realisation(s)"
@@ -382,11 +392,26 @@ def test_oracle_query_phrasing_actually_varies():
     leaf_kws = {opts[k][2] for opts in _LEAF_ATTR.values() for k in opts}
     missing = leaf_kws - set(_LEAF_QUERY_VARIANTS)
     assert not missing, f"FAIL: leaf keywords with no realisations (they would not vary): {missing}"
-    seen = set()
+    # Every emitted query must end in a CANONICAL keyword, and no non-canonical
+    # realisation may appear. Match on the keyword suffix rather than on a split
+    # position: the entity name that prefixes it is multi-word and variable.
+    canonical = {v[0] for v in _REL_QUERY_VARIANTS.values()} |                 {v[0] for v in _LEAF_QUERY_VARIANTS.values()}
+    non_canonical = ({v for vs in _REL_QUERY_VARIANTS.values() for v in vs[1:]} |
+                     {v for vs in _LEAF_QUERY_VARIANTS.values() for v in vs[1:]}) - canonical
+    seen, leaked = set(), []
     for t in generate(200, seed_start=0):
         for step in t.oracle_plan:
-            seen.add(step["arguments"]["query"].split(" ", 1)[-1])
-    assert len(seen) >= 15, f"FAIL: only {len(seen)} distinct query phrasings across 200 tasks"
+            q = step["arguments"]["query"]
+            hit = {kw for kw in canonical if q == kw or q.endswith(" " + kw)}
+            assert hit, f"FAIL: query {q!r} ends in no canonical keyword"
+            seen |= hit
+            # A non-canonical variant that is not itself a suffix of a canonical
+            # one is proof the draw came back: check the longest match only.
+            for kw in non_canonical:
+                if (q == kw or q.endswith(" " + kw)) and len(kw) > len(max(hit, key=len)):
+                    leaked.append((q, kw))
+    assert not leaked, f"FAIL: non-canonical phrasing reached the plan: {leaked[:5]}"
+    assert len(seen) >= 10, f"FAIL: only {len(seen)} canonical keywords exercised across 200 tasks"
 
 
 def test_phrasing_does_not_shift_the_generator_stream():

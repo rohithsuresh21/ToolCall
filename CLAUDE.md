@@ -162,6 +162,39 @@ Together that is a large part of the synthetic-to-real gap: 100% on synthetic 2-
 kind, picked by a hash of (seed, doc_id), and `generator._REL_QUERY_VARIANTS` /
 `_LEAF_QUERY_VARIANTS` hold three per relation and per leaf attribute.
 
+**The QUERY half of that was reverted in v3; the PASSAGE half stands.** Unanchoring both at once
+(v2, `data/sft.jsonl` at 2270 records) LOST F1 on the 54 real judge rows: 30.2% -> 21.4%, 3-hop
+collapsing 27.8% -> 9.7% and exact match to 0%, with the base model rechecking at exactly 5.1% so
+the eval path was unchanged and the regression was real. The model also searched MORE and answered
+worse (3-hop calls 4.39 -> 5.50). v3 keeps `_PASSAGE_TEMPLATES` varied and pins the oracle plan to
+`_REL_QUERY_VARIANTS[st][0]` / `_LEAF_QUERY_VARIANTS[kw][0]` -- index 0 is the canonical keyword by
+construction (`== _REL[st][4]`, `== the leaf key`), which `test_oracle_query_phrasing_is_canonical`
+asserts along with the absence of any non-canonical realisation in a minted plan. The tables and
+`_variant_rng` are deliberately KEPT populated and `test_shortcut_filter.py` still imports the
+stream: restoring variation must stay a two-line change, and a collapsed table would make that
+revert a silent no-op. **v2 changed two things at once, so v3 isolates the query half — if 3-hop
+does not recover, the unanchored passages are the remaining suspect, not a third cause.**
+
+The plausible mechanism, which is why the passage half was NOT reverted with it: three realisations
+per relation mean the same hop is asked for in three different ways across otherwise identical
+episodes, so query FORM carries no learnable signal and the policy probes instead of committing --
+consistent with the call-count rise. Unanchored passages change what retrieval RETURNS, which is
+the problem the model is supposed to learn; unanchored queries only change how the reference asks
+for it. `w_args_strict` was already set to 0.0 for the same reason (see below): once the oracle
+draws one of three phrasings, matching its exact string is a coin flip the policy cannot observe.
+
+**Reverting the query half makes the terminal-read gate fire about twice as often, and it is the
+only thing standing between that and a bad build.** Canonical leaf keywords against unanchored
+passages is precisely the "Khaldonia official language" case below -- the sibling that kept the
+literal keyword outranks the passage that owns the fact. Measured on the v3 build (6000 seeds,
+12,371 raw candidates): `unretrievable_rejected` 3, about 1 in 4,100, against the ~1 in 8,600
+recorded for v2. Still rare, still caught, and the built set audits CLEAN -- but the rate moved in
+the direction the mechanism predicts, so do not treat that gate as optional when changing phrasing.
+`broken_chain_rejected` went the other way and fired **0** times on the v3 train pool: its known
+trigger is the "seat of government" city realisation, which is a non-canonical hop phrasing and can
+no longer be drawn. The axis is dormant on this pool, not removed -- `test_shortcut_filter.py` pins
+it independently of the generator, which is what keeps it from decaying into dead code.
+
 **Unanchoring makes siblings outrank the passage that owns the fact, which is the point.**
 Traced live: "Khaldonia official language" scored Vestorland 4.66, Caldury 4.57, Orinella 4.57
 and Khaldonia — which owns the answer — only 4.25, because those three kept the literal
@@ -190,6 +223,14 @@ the pre-change generator in prompt, gold, route and answer, and differ only in q
 With the filters ON, 55/600 tasks legitimately differ — a leaky attribute under one phrasing
 is not leaky under another, so the filters accept a different candidate. That is the filters
 re-evaluating, not the stream shifting.
+
+The same asymmetry is why **a phrasing change is a REBUILD, never a patch of the existing set.**
+Pinning the draw to index 0 does not touch `rng`, but a route the filters reject under one phrasing
+advances the loop to the next route, and `_resolve_chain` DOES draw from `rng` — so the seed mints
+a different task. Measured v2 -> v3 at full build size: of 2270 and 2280 records, only 1923 task_ids
+are shared (347 dropped, 357 new) and 70 of the shared ids carry a different question. Seed ranges
+and task_id derivation are untouched, so the train/dev/GRPO disjointness argument carries over
+intact; what changes is WHICH task a given seed mints, for roughly one seed in eleven.
 
 **`Task.chain` records what `route` resolved to.** `route` is the relation names; `chain` is
 the entity names they landed on, `len(route) + 1` of them. It is recorded rather than
@@ -294,9 +335,10 @@ batched `generate()` per turn, because GRPO needs G rollouts per task per step.
 assistant turns, silently desynchronising multi-turn training from multi-turn inference.
 `assistant_spans()` is the masking contract: loss covers assistant content plus its
 `<|im_end|>` and the newline `render()` writes after it — nothing else. (That trailing newline
-is inert at inference: generation stops on `<|im_end|>`.) Verified over all 1951 records of
-`data/sft.jsonl` with the real Qwen3 tokenizer: 0 prefix-stability violations and the
-`min(e, len(full_ids))` clamp never fires. Training on tool results teaches the model to hallucinate
+is inert at inference: generation stops on `<|im_end|>`.) Re-verified on the v3 set — all 2280
+records / 11,172 assistant spans of `data/sft.jsonl` with the real Qwen3 tokenizer: 0
+prefix-stability violations and the `min(e, len(full_ids))` clamp never fires. (First measured
+at 1951 records; re-run it when the set is rebuilt rather than carrying the old number forward.) Training on tool results teaches the model to hallucinate
 `<tool_response>` blocks instead of calling the tool — that looks fine on the loss curve and
 scores zero on executable tasks.
 
@@ -483,3 +525,30 @@ realisations, undoing the change with no error anywhere.
 - Module docstrings carry the design rationale ("why", not "what"), and several encode
   invariants the tests assert. `test_fix2.py` asserts that specific dead code stays deleted,
   so reintroducing a removed symbol breaks it on purpose.
+
+## Open issues in the run tooling
+
+Both of these are in the node-run scripts, not in the pipeline the tests cover, so nothing in
+the CPU gate will surface either one.
+
+**A live SSH password is committed in cleartext, and it is in git history.**
+`scripts/pull_grpo_now.py:17` (`HOST, PORT, USER, PW = ...`) and `scripts/stop_grpo_now.py:25`
+(the `or "..."` fallback behind `ATR_SSH_PW`) both carry the reservation password for
+`gpu17@10.214.5.55`. They entered the repo in `a519e46` and `fa207ce`. **Deleting the lines is
+not sufficient** — the value stays reachable in those commits for anyone who can read the repo,
+so the credential has to be ROTATED on the reservation side; the source change is the follow-up,
+not the fix. When it is reworked, `stop_grpo_now.py` already reads `ATR_SSH_PW` first, so
+dropping the literal and requiring the env var is the smaller change of the two. Prefer an SSH
+key over a password in the environment if the reservation allows one.
+
+**`60_pipeline_tomorrow.sh` can never write `best/` on a STOP-signal run.** It passes
+`--eval-every 50` alongside `--save-every 5`, and `grpo.py` only writes `best/` inside
+`if self.cfg.eval_every and step % self.cfg.eval_every == 0` — the same branch that runs the dev
+canary. The STOP file (`fa207ce`) is checked at the top of the step loop and breaks out, so a run
+stopped at any step below 50 never hits a canary step: `best/` is never written, F6 checkpoint
+selection never runs, and the pipeline's `cp -r "$OUT"/final/. "$OUT"/` then promotes the LAST
+step, which the dev and judge evals score as if it were the selected one. **Use
+`--eval-every 5`** so the canary cadence matches the checkpoint cadence and `best/` exists
+whenever a checkpoint does. Note this is not just a missing artifact — reports from such a run
+are labelled as the pipeline's result while being the last step, and at a 15-task canary the two
+can differ by more than the effects being measured.
