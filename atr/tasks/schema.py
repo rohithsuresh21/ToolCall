@@ -143,6 +143,60 @@ def norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# Capitalised words that are NOT entity names. A search query the model could not
+# have written is identified by a proper noun absent from the prompt; an
+# interrogative or an article that merely happens to sit at the start of a
+# sentence is not one. This is the same trap `_oracle_entity` fell into -- it
+# anchored the entity at `^` and silently resolved 895 of 2354 plan queries to ""
+# once realisations stopped leading with the entity.
+_NON_ENTITY_CAPS = frozenset("""
+a an the of in on at and or for to by i it its this that these those he she they
+his her their there then when what where which who whom whose why how as is was
+were be been from with about after before during however although while but also
+such other did does do done can could would should will may might must
+""".split())
+
+
+def psychic_caps(query: str, prompt: str, prose: bool = False) -> list[str]:
+    """Capitalised tokens in `query` that the `prompt` does not contain -- i.e. the
+    proper nouns a model would have had to invent to write this text.
+
+    ONE definition, shared by the build-time gate (atr/data/real_chains.py) and the
+    post-hoc auditor (tests/audit_sft.py), so a set cannot be built against one rule
+    and judged against another.
+
+    Function words are excluded, and that exclusion is load-bearing rather than
+    cosmetic. Synthetic oracle queries are keyword fragments ("Meridian City
+    capital") that never open on a capitalised function word, but real MuSiQue
+    sub-questions are whole sentences ("What country was Signmark from?"). Counting
+    their leading "What" as an invented entity flagged 404 of 2055 otherwise-clean
+    real chains -- 20% of the yield -- for a word that names nothing.
+
+    `prose=True` additionally ignores SENTENCE-INITIAL capitalised words, and is for
+    <think> blocks rather than queries. In running prose the first word of every
+    sentence is capitalised whatever it is ("Starting point: ...", "Step one is
+    ..."), so its capitalisation carries no evidence of proper-noun-hood; in a
+    keyword-fragment query there are no sentences and the leading token is usually
+    the entity itself, which is exactly what the check must still see. The cost of
+    `prose=True` is that a one-word invented entity opening a sentence would be
+    missed -- which is why no template in atr/data/reasoning.py opens a sentence
+    with an entity, and why tests/test_reasoning.py asserts that it never does."""
+    low = (prompt or "").lower()
+    out = []
+    for m in re.finditer(r"[A-Za-z]+", query or ""):
+        tok = m.group(0)
+        if not tok[:1].isupper():
+            continue
+        if tok.lower() in _NON_ENTITY_CAPS or tok.lower() in low:
+            continue
+        if prose:
+            before = (query or "")[:m.start()].rstrip()
+            if not before or before[-1] in ".?!:":
+                continue
+        out.append(tok)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # token-level F1 (the official judge metric)
 # ---------------------------------------------------------------------------

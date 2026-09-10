@@ -33,6 +33,7 @@ from typing import Sequence
 from ..agent.loop import Trajectory
 from ..agent.prompt import system_message
 from ..tasks.schema import ScoreCard, Task
+from .reasoning import think_for_answer, think_for_call
 from ..tools.adapter import get_registry
 
 
@@ -62,13 +63,22 @@ def _shorten(text: str, limit: int) -> str:
 
 
 def _rationale(step_idx: int, call: dict, task: Task) -> str:
-    """Minimal templated reasoning for oracle replays. OFF by default.
+    """Synthesised reasoning for oracle replays. OFF by default (`oracle_rationale`).
 
-    Templated rationales are a bootstrap, not a diet: they teach the shape of
-    'think then act', but a model trained only on them learns a script and stops
-    adapting when a tool result surprises it. Mix at most ~30% templated.
+    This used to be one fixed sentence -- "I need search to get the next piece of
+    information." -- which is worse than nothing: it teaches the model to emit a
+    <think> block that carries no state, which is precisely the failure the real
+    thing has to fix. `atr/data/reasoning.py` builds a block that names what the
+    PREVIOUS result revealed and what this hop needs, from the chain the generator
+    recorded. Read that module's docstring before changing anything here; the
+    "may only name what the episode has already seen" invariant lives there and
+    tests/audit_sft.py re-checks it on the built set.
+
+    Still a bootstrap, not a diet: templated rationales teach the shape of "think
+    then act" and nothing about adapting when a tool result surprises you. GRPO is
+    where that gets learned.
     """
-    return f"I need {call['name']} to get the next piece of information."
+    return think_for_call(task, step_idx)
 
 
 def canonical_assistant_turn(thinking: str, call: dict | None, answer: str | None,
@@ -91,11 +101,16 @@ def trajectory_to_record(task: Task, traj: Trajectory, cfg: ExportConfig,
     messages = [{"role": "system", "content": system_message(registry, cfg.prompt_mode)},
                 {"role": "user", "content": task.prompt}]
 
+    call_idx = 0
     for step in traj.steps:
         thinking = step.thinking
-        if not thinking and cfg.oracle_rationale and step.tool_calls:
-            thinking = _rationale(step.index, step.tool_calls[0], task)
+        if not thinking and cfg.oracle_rationale:
+            # Index by CALL, not by step: reasoning.py is keyed on the oracle plan,
+            # and a step that emitted no call must not consume a plan position.
+            thinking = (_rationale(call_idx, step.tool_calls[0], task) if step.tool_calls
+                        else think_for_answer(task, traj.final_answer))
         if step.tool_calls:
+            call_idx += 1
             call = step.tool_calls[0]
             messages.append({"role": "assistant",
                              "content": canonical_assistant_turn(thinking, call, None, cfg)})

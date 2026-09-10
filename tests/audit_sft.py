@@ -45,10 +45,11 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from atr.tasks.schema import norm_text  # noqa: E402
+from atr.tasks.schema import norm_text, psychic_caps  # noqa: E402
 
 CALL = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
 FINAL = re.compile(r"<final_answer>(.*?)</final_answer>", re.S)
+THINK = re.compile(r"<think>(.*?)</think>", re.S)
 
 
 def _hit_texts(tool_content: str) -> list[str]:
@@ -77,6 +78,7 @@ def audit(path):
     n = 0
     hops = Counter()
     psychic = Counter()
+    psychic_think = Counter()
     unretrieved = Counter()
     first_hit = defaultdict(Counter)
     early = Counter()
@@ -99,10 +101,24 @@ def audit(path):
         calls_per_hop[hop][len(queries)] += 1
 
         # 1. psychic first query
-        if queries:
-            caps = [t for t in re.findall(r"[A-Za-z]+", queries[0]) if t[:1].isupper()]
-            if any(c.lower() not in user.lower() for c in caps):
-                psychic[hop] += 1
+        if queries and psychic_caps(queries[0], user):
+            psychic[hop] += 1
+
+        # 5. psychic REASONING: a <think> block that names something the episode
+        #    has not been shown yet. Same defect as a psychic query and strictly
+        #    worse -- an invented query is at least scored by retrieval, whereas
+        #    invented deliberation is teacher-forced hallucination. Checked against
+        #    the prompt plus every tool_response STRICTLY BEFORE that turn.
+        thinks = [THINK.search(a.get("content", "")) for a in asst]
+        seen_text = norm_text(user)
+        for i, tm in enumerate(thinks):
+            if tm is not None:
+                for c in psychic_caps(tm.group(1), user, prose=True):
+                    if norm_text(c) and norm_text(c) not in seen_text:
+                        psychic_think[hop] += 1
+                        break
+            if i < len(tool):
+                seen_text += " " + " ".join(norm_text(x) for x in _hit_texts(tool[i]))
 
         # 2/3. answer retrieval + label conflicts
         fa = FINAL.search(asst[-1].get("content", "")) if asst else None
@@ -129,12 +145,13 @@ def audit(path):
 
     print(f"\n{'='*78}\n{path}   {n} records\n{'='*78}")
     print(f"{'hop':>4} {'n':>6} {'searches':>10} {'psychic 1st q':>16} "
-          f"{'answer never retrieved':>24}")
+          f"{'psychic <think>':>18} {'answer never retrieved':>24}")
     for h in sorted(hops, key=lambda x: (x is None, x)):
         tot = hops[h]
         ncalls = "/".join(str(k) for k in sorted(calls_per_hop[h]))
         print(f"{str(h):>4} {tot:>6} {ncalls:>10} "
               f"{psychic[h]:>7} {psychic[h]/tot:>7.1%} "
+              f"{psychic_think[h]:>9} {psychic_think[h]/tot:>7.1%} "
               f"{unretrieved[h]:>13} {unretrieved[h]/tot:>8.1%}")
 
     print("\nearliest call whose result already contains the gold answer "
@@ -160,7 +177,8 @@ def audit(path):
         print(f"  {h}-hop: {len(c)} distinct answers / {tot} records; "
               f"top answer share {c.most_common(1)[0][1]/tot:.1%}")
 
-    clean = (sum(psychic.values()) == 0 and sum(unretrieved.values()) == 0
+    clean = (sum(psychic.values()) == 0 and sum(psychic_think.values()) == 0
+             and sum(unretrieved.values()) == 0
              and sum(early.values()) == 0 and not dupes)
     print(f"\nVERDICT: {'CLEAN' if clean else 'DEFECTS PRESENT'}")
     return clean
