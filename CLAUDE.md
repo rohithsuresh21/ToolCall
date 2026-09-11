@@ -31,7 +31,9 @@ python tests/test_shortcut_filter.py   # shortcut + prefix-leak filters, train/d
 python tests/test_naturalize.py        # naturalization with a mock LLM (offline)
 python tests/test_grpo_resume.py       # GRPO checkpoint/resume/wall-clock stop (CPU, no model)
 python tests/test_source_split.py      # per-source (synthetic/real) GRPO group accounting
-python tests/audit_sft.py data/sft.jsonl  # built-set audit: psychic queries, unretrieved/early answers, label conflicts
+python tests/test_real_chains.py       # MuSiQue #N resolution gates + synthesised <think> invariants
+python tests/audit_sft.py data/sft.jsonl  # built-set audit, FIVE axes: psychic first query, unretrieved/early
+                                          # answers, label conflicts, psychic <think>
 python tests/verify_dataset.py         # needs artifacts/naturalized_passages_scaled.json
 python tests/verify_naturalize_live.py # needs artifacts/naturalized_passages.json
 
@@ -45,8 +47,16 @@ python tests/audit_sft.py artifacts/sft_candidate.jsonl && mv artifacts/sft_cand
 # judge task set: 54 public rows, rebuilt from the hub, byte-identical every run
 python scripts/make_judge_tasks.py            # -> data/judge_tasks.jsonl
 
-# GPU stages (bash scripts; env vars MODEL/ADAPTER/OUT override defaults)
+# real MuSiQue -> EXECUTABLE chains, then the combined (synthetic + real) SFT set
+python scripts/make_musique_chain_tasks.py    # -> data/musique_chain_tasks.jsonl (1935 rows)
+python scripts/11_build_combined.py --n 6000 --real-frac 0.35 --out artifacts/sft_r35_candidate.jsonl --promote-to data/sft_r35.jsonl
+python scripts/11_build_combined.py --n 6000 --real-frac 0.0  --out artifacts/sft_r0_candidate.jsonl  --promote-to data/sft_r0.jsonl
+# --no-promote leaves the candidate in artifacts/ for inspection; the script REFUSES to
+# promote a set the auditor calls DEFECTS PRESENT. --no-reasoning is the pre-<think> baseline.
+
+# GPU stages (bash scripts; env vars MODEL/ADAPTER/OUT/DATA override defaults)
 scripts/20_sft.sh   scripts/30_grpo.sh   scripts/40_eval.sh   scripts/60_merge_export.sh
+DATA=data/sft_r35.jsonl bash scripts/50_sft_4b.sh   # the real-mix arm of the ablation
 
 # GRPO inside a fixed reservation: stop cleanly at 3h30m, then continue next session
 MAX_SECONDS=12600 bash scripts/30_grpo.sh
@@ -105,9 +115,9 @@ The pre-fix 5850-record build had 798 of 2600 distinct questions carrying confli
 does *not* catch this: `task_id` carries the seed, so each collision is a different task.
 Disambiguating the prompt instead was rejected deliberately — the judge's questions carry no
 world marker, so it would train a format the model never sees at eval.
-`tests/audit_sft.py <path>` checks a built set for all four defects (psychic first query,
-unretrieved answer, conflicting labels, prefix leakage) and works on any jsonl, including one
-built elsewhere. It exits non-zero when any of them is present.
+`tests/audit_sft.py <path>` checks a built set for all FIVE defects (psychic first query,
+unretrieved answer, conflicting labels, prefix leakage, psychic `<think>`) and works on any
+jsonl, including one built elsewhere. It exits non-zero when any of them is present.
 
 **The candidate filter has four axes; the single-search one only sees the first.**
 `_is_shortcut_solvable` is MuSiQue disconnection filtering: fire ONE `search` on the full
@@ -266,6 +276,107 @@ A real MuSiQue-Ans train task (`data/musique_train_tasks.jsonl`, 3975 rows built
 `Task.documents`; that set REPLACES the seeded synthetic world, because its `seed` is a
 fingerprint of the source row rather than a world recipe. `GRPOConfig.real_tasks_path` /
 `real_fraction` mix them into each step's task draw.
+
+**Oracle trajectories carry synthesised `<think>` reasoning, and that is a CARRY fix, not a
+style choice.** The diagnosis was one failed 4-hop judge trajectory: *"Where does the second
+largest city in the state where Yuma's Library District is located hold NASCAR races?"* The
+model fired `"Yuma Arizona Library District"`, `"Yuma County Arizona"`, `"Yuma County Arizona
+largest city"` — three rephrasings orbiting the prompt's own entity, all returning the
+identical three documents. Tucson was in the top-3 of call 1 and was never used, and every step
+carried `"thinking": ""`. That is not a retrieval failure: nothing in the turn transports an
+entity out of one tool result into the next query. And it is exactly what the data taught —
+oracle trajectories were bare `<tool_call>` blocks, correct BECAUSE the generator already knew
+the chain, so the plan never had to show the step where the chain is *discovered*.
+`atr/data/reasoning.py` writes that step down: before each call, a block naming what the
+previous result revealed and what the next hop needs. `ExportConfig.oracle_rationale` is the
+switch and is now meaningful (`scripts/11_build_combined.py --no-reasoning` is the baseline).
+What it costs, measured with the real `Qwen/Qwen3-4B` tokenizer through `assistant_spans`:
+supervised tokens go **7.59% → 14.87%** of the sequence (103 → 220 per example) for a 9%
+longer sequence (1360 → 1476) — roughly **2.1x the supervised signal**. Nothing in any of the
+three sets comes near `--max-len 4096`, so `sft.build_dataset` drops nothing (`sft_r0` max
+1872; `sft_r35` max 3707, and that tail is real 4-hop, whose 20 MuSiQue passages are longer
+than a synthetic world's). This is a BOOTSTRAP, not a diet: templated rationales teach the
+shape of "think then act" and nothing about adapting when a result surprises you. GRPO is
+where the adapting gets learned; this is what gives it a policy that carries entities at all.
+
+Two invariants, both load-bearing. **(1) A block may name ONLY what the episode has already
+seen** — the prompt, and the passages strictly earlier calls returned. `_reveals()` is the
+accessor: the block before step k may reference `chain[k]`, put on screen by step k-1, and
+never `chain[k+1]`. Naming the next entity early is the psychic-query defect wearing a
+different hat and is strictly worse — an invented query is at least scored by retrieval,
+whereas invented deliberation is pure teacher-forcing of a hallucination. **(2) Phrasing comes
+from `sha1(task_id|step)`, never a live RNG**, so a rebuild is byte-identical; a shared RNG
+stream would also re-point every seed after it (same argument as `generator._variant_rng`).
+A third rule follows from how the auditor reads these blocks: **no template may put a bare
+entity name where a sentence starts**, colons included, because `psychic_caps(prose=True)`
+ignores sentence-initial capitals. `"Starting point: {head}."` did exactly that and was
+changed; it never produced a defect (a synthetic head entity is always named by the prompt),
+but the invariant is what the auditor's blind spot is traded against, so it has to hold.
+`tests/test_real_chains.py` pins it, and `{goal}` is the documented exemption — it expands to
+the hop's own query, which `real_chains` has already gated.
+
+**`real_chains.py` turns MuSiQue's decomposition into an executable plan, and every gate it
+applies is about what an EPISODE can see.** `question_decomposition` is a sketch: 59.3% of its
+sub-questions still carry a `#N` placeholder, which is not a BM25 query, so only 20.7% of the
+3975 rows execute as shipped. `#N` is resolved to a capitalised span drawn from hop N's OWN
+top-k hits — passages the episode has already been shown — and the candidate must occur in the
+evidence this hop then retrieves, be entity-like, and not merely restate hop N's own subject.
+The chain must then retrieve new support at every hop, carry the gold answer in the FINAL hop
+and in no earlier one, and **name no proper noun the episode has not been shown, at ANY hop**.
+Measured yield at `top_k=3`: **1935 of 3975 (48.7%), split 1132 / 521 / 282** across 2/3/4
+hops; rejections 1310 substitution-not-in-evidence, 451 no-new-evidence, 119 gold-leaks-early,
+115 psychic-hop-2+, 45 psychic-first-query. The 4-hop tail is thin by construction — the gates
+that make a 4-hop chain trainable are the ones a 4-hop chain is most likely to fail — and that
+scarcity is a fact about MuSiQue, not a tuning knob.
+
+**Query writability is TWO gates because it rejects two populations.**
+`require_writable_first_query` checks hop 1 against the question alone: it catches a
+decomposition whose entry point is an entity the asker never supplied.
+`require_writable_later_queries` checks hops 2+ against the question PLUS the prose of every
+strictly earlier hit: it catches a sub-question that assumes a name retrieval has not surfaced
+("Where are the villages of Wengen and Zermatt located?" — the chain reveals Zermatt and
+nothing reveals Wengen). Only the first existed at first, and 3 of 325 records in the first
+combined smoke build tripped audit axis 5 because of it: the synthesised `<think>` quotes the
+resolved sub-question verbatim, so a psychic *query* surfaces as psychic *deliberation*. The
+second gate costs 74 rows (2009 → 1935), **53 of them 4-hop** — the thinnest family pays most,
+because a longer chain has more hops that can assume a name. Note the same hop-2 query can be
+psychic in one row and clean in another: each real row owns its own 20 passages, so hop 1
+returns different prose.
+
+**`schema.psychic_caps` is the ONE definition of "a name the episode could not have known",**
+shared by the build-time gate and `tests/audit_sft.py`, so a set cannot be built against one
+rule and judged against another. Its exclusion of capitalised FUNCTION words is load-bearing,
+not cosmetic: synthetic oracle queries are keyword fragments ("Meridian City capital") that
+never open on one, but real sub-questions are whole sentences ("What country was Signmark
+from?"), and counting their leading `What` as an invented entity rejected **404 of 2055**
+otherwise-clean chains — 20% of the yield — for a word that names nothing. Same trap
+`_oracle_entity` fell into by anchoring at `^`.
+
+**`ChainConfig.subject_rule` stays `"subset"`, and `"overlap"` is worse, not just stricter.**
+`subset` rejects a substitution only when EVERY token of it already appears in hop N's own
+query; `overlap` rejects on any shared content token. Measured on the full pool: 1935 kept
+under `subset` vs 1911 under `overlap`, 32 rows only in the first, 8 only in the second — and
+**46 of the 1903 shared rows resolve to a DIFFERENT name**, which is the part that matters.
+MuSiQue nests place names, so `overlap` throws away correct answers that legitimately reuse a
+question word: for "What city is WAYV located?" it refuses "Atlantic City" because `city` is
+shared and substitutes "New Jersey" instead — a wrong resolution that still clears the occurs
+gate, because New Jersey is in the same passage. The net change is small; its direction is bad.
+
+**`data/musique_chain_tasks.jsonl` inherits judge-disjointness rather than re-earning it.**
+`scripts/make_musique_chain_tasks.py` reads `data/musique_train_tasks.jsonl`, does not touch
+the hub and does not resample: it only REWRITES each row's `oracle_plan` and drops rows. The
+double fingerprint check recorded above therefore carries over unchanged. Re-verify it only if
+the source pool is ever rebuilt.
+
+**The combined build filters and balances the two sources SEPARATELY.**
+`scripts/11_build_combined.py` exists because `target_mix` balances by task TYPE and both
+sources use the same three type names, so pooling them and asking for 40/30/30 would silently
+let whichever source is more plentiful fill each hop family. `--real-frac` is a request, not a
+guarantee: the real slice is supply-capped, and the script says so out loud instead of
+renormalising. **The real slice is deliberately NOT rebalanced to 40/30/30** — doing so caps
+it at `282 / 0.30 ≈ 940` records and throws away ~600 real 2-hop rows to buy nothing, since
+the 4-hop count is fixed at 282 either way. Taking the real pool as-is and letting the
+synthetic side carry the hop balance gets every real 4-hop row AND more real prose.
 
 **`world_for_task()` is the one place that turns a task into a World.** The rule used to be
 inlined in `_Episode.__init__` alone, so `retrievability.check_task` kept calling
@@ -508,8 +619,20 @@ realisations, undoing the change with no error anywhere.
 ## Conventions
 
 - `artifacts/` is gitignored except `artifacts/sft_sample.jsonl`. Committed data lives in
-  `data/sft.jsonl` and `data/judge_tasks.jsonl`. SFT records are `{messages, tools, meta}`
-  JSONL, UTF-8.
+  `data/sft.jsonl`, `data/judge_tasks.jsonl`, `data/musique_train_tasks.jsonl` and
+  `data/musique_chain_tasks.jsonl`. SFT records are `{messages, tools, meta}` JSONL, UTF-8.
+- **Three committed SFT sets, and the difference between them is ONE variable each.**
+  `data/sft.jsonl` (2280 records) is the v3 set with NO reasoning — the pre-`<think>`
+  baseline. `data/sft_r0.jsonl` (2280) is the same synthetic population WITH `<think>`, and
+  `data/sft_r35.jsonl` (3508 = the identical 2280 synthetic + 1228 real at 35.0%) adds real
+  MuSiQue prose. The 2280 synthetic records are **byte-identical in both** (at 0.35 the real
+  side is the binding constraint, so the synthetic slice is taken whole), so `r0` vs `r35`
+  isolates the real slice and nothing else, and `sft.jsonl` vs `r0` isolates the reasoning.
+  The real slice is un-rebalanced, hop mix 718 / 326 / 184 — note 0.35 spends only 184 of the
+  282 real 4-hop rows; taking all of them means `--real-frac 0.46`, which is the whole pool.
+  Train `--data` at whichever arm you are reading;
+  do not rebuild one arm without rebuilding both, since a template or gate change moves the
+  population under all of them.
 - **Training inputs come from `data/`, never `artifacts/`, and the gate enforces it.**
   `20_sft.sh` and `50_sft_4b.sh` source `scripts/lib_data_gate.sh` and call
   `require_clean_dataset`, which runs `tests/audit_sft.py` and refuses to start on

@@ -37,6 +37,9 @@ def main() -> None:
     ap.add_argument("--allow-leaks", action="store_true",
                     help="keep chains whose gold answer appears before the final hop")
     ap.add_argument("--allow-psychic-first-query", action="store_true")
+    ap.add_argument("--allow-psychic-later-queries", action="store_true",
+                    help="keep chains whose hop-2+ query names an entity neither the "
+                         "question nor any earlier hit contains")
     ap.add_argument("--skip-index-check", action="store_true")
     args = ap.parse_args()
 
@@ -53,7 +56,8 @@ def main() -> None:
 
     cfg = ChainConfig(top_k=args.top_k, subject_rule=args.subject_rule,
                       require_leak_free=not args.allow_leaks,
-                      require_writable_first_query=not args.allow_psychic_first_query)
+                      require_writable_first_query=not args.allow_psychic_first_query,
+                      require_writable_later_queries=not args.allow_psychic_later_queries)
     kept, stats = build_chain_tasks(rows, cfg)
     if not kept:
         raise SystemExit("FATAL: every row was rejected -- refusing to write an empty pool.")

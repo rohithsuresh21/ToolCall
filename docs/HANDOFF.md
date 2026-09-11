@@ -105,7 +105,7 @@ committed `data/sft.jsonl`.
 
 ### Real-chain yield (top_k=3, defaults)
 
-**2009 / 3975 = 50.5%**, hop mix **1138 / 536 / 335**. Rejections per axis:
+**2009 / 3975 = 50.5%**, hop mix **1138 / 536 / 335**. Rejections per axis (SUPERSEDED -- the hop-2+ gate below takes this to 1935 / 48.7%, 1132 / 521 / 282):
 
 | axis | n | % |
 |---|---|---|
@@ -136,93 +136,170 @@ real sub-question's leading `What` / `Where` / `Which` as an invented entity rej
 **404 of 2055** otherwise-clean chains — 20% of the yield — for a word that names
 nothing. This is the same trap `_oracle_entity` fell into by anchoring at `^`.
 
-## What is LEFT
+## What was LEFT, and what happened to it (2026-09-11, second session)
 
-### 1. Hop-2+ psychic queries in real chains — **do this first**
+All five items below are DONE and committed. CLAUDE.md now carries the durable version
+of this; what follows is the diff-level record.
 
-The smoke build audits **DEFECTS PRESENT**: 3 of 325 records (all 4-hop) trip the new
-psychic-`<think>` axis. They are **genuine**, not template noise:
+### 1. Hop-2+ psychic queries — FIXED
 
-    4hop3__166346_… "That gives me Zermatt. Now: Where are the villages of Wengen and Zermatt located?"
-    4hop3__5752_…   "Now I have United States. The next step: Federal Detention Center, United States >> country?"
-    4hop3__31642_…  "The result names Lockerbie. Next: All Saints Church, Lockerbie >> located in …?"
+`ChainConfig.require_writable_later_queries` (default on) checks every hop 2..L's
+resolved query with `psychic_caps` against the question PLUS the norm_text prose of
+every strictly earlier hit, with its own rejection key `psychic_query_hopN`. Hop 1's
+gate is untouched and still fires at the end of `_resolve`, so a row failing both is
+counted under the later-hop key (that is the check that fires first).
 
-`Wengen`, `Federal Detention Center` and `All Saints Church` appear in MuSiQue's own
-sub-question but in neither the question nor any earlier retrieved passage. The build-time
-gate (`ChainConfig.require_writable_first_query`) only checks **hop 1**; hops 2+ escape it.
-The `<think>` text is the same string as the query, so this is a psychic *query* that the
-new audit axis surfaced — the reasoning did not invent it.
+Yield **2009 → 1935 of 3975 (50.5% → 48.7%)**, hop mix **1138/536/335 → 1132/521/282**.
+The gate costs 74 rows and **53 of them are 4-hop** — the thinnest family pays most,
+because a longer chain has more hops that can assume a name. New rejection table:
 
-**Fix:** in `real_chains._resolve`, extend the writability check to every hop — a query's
-`psychic_caps` must be empty against *prompt + text of all strictly earlier hits*. The
-per-hop hit texts are already in scope as `hop_hits` / `idx.blob`. Then re-measure yield
-(expect a few percent below 2009) and update the docstring's MEASURED YIELD block and the
-table above. Keep it a named `ChainConfig` flag with its own rejection key, per the
-"one key per axis" convention.
+| axis | n | % |
+|---|---|---|
+| substitution_not_in_evidence | 1310 | 33.0% |
+| no_new_evidence | 451 | 11.3% |
+| gold_leaks_early | 119 | 3.0% |
+| psychic_query_hop2+ | 115 | 2.9% |
+| psychic_first_query | 45 | 1.1% |
 
-### 2. The combined build
+`data/musique_chain_tasks.jsonl` rebuilt: 1935 rows, sha256 `ae7f5348…`.
 
-Not yet run at full size — only a 300-seed smoke build. After fix 1:
+All three smoke-build offenders are now rejected, and all three come back when the
+flag is off — `tests/test_real_chains.py::test_later_hop_gate_is_the_thing_that_rejects`
+pins that both ways, which is what distinguishes a working gate from a row that was
+already failing something else. Non-obvious: the SAME hop-2 query is psychic in one
+row and clean in another, because each real row owns its own 20 passages, so hop 1
+returns different prose.
 
-```bash
-python scripts/make_musique_chain_tasks.py
-python scripts/11_build_combined.py --n 6000 --real-frac 0.35 --no-promote
-# inspect the audit, then drop --no-promote to write data/sft.jsonl
-```
+### 2–3. The two datasets — BUILT, both CLEAN
 
-### 3. A test for `real_chains.py`
+Full builds, `--n 6000`, not the smoke.
 
-`tests/test_real_chains.py` does not exist yet. Match the house style (plain script,
-`check(cond, label)`, `sys.exit(1)`; no pytest). It should cover:
-- `verify_index()` == 100% (without it every yield number describes a re-implementation)
-- a pinned known-rejection per axis, the way `test_shortcut_filter.py` pins seed 735 —
-  a gate that fires on 1% is indistinguishable from dead code under a sampling test
-- `tidy_query()` never changes a BM25 token
-- determinism: two `build_chain_tasks` runs are byte-identical
-- `reasoning.think_for_call` never names `chain[k+1]` at step k, and **no template opens
-  a sentence with an entity** (the `prose=True` audit mode cannot see one there)
+| | records | 2-hop | 3-hop | 4-hop | audit |
+|---|---|---|---|---|---|
+| `data/sft_r0.jsonl` | 2280 | 912 | 684 | 684 | CLEAN |
+| `data/sft_r35.jsonl` | 3508 | 1630 | 1010 | 868 | CLEAN |
 
-### 4. CLAUDE.md updates
+`r35` = the identical 2280 synthetic + 1228 real (35.0%, asked 35.0%). Real slice
+un-rebalanced as recommended: **718 / 326 / 184**. The 2280 synthetic records are
+**byte-identical between the two files** — at 0.35 the real side is the binding
+constraint, so the synthetic slice is taken whole rather than sub-sampled. So the
+ablation isolates exactly one variable, and `data/sft.jsonl` (the untouched v3 set,
+no `<think>`) is a third arm isolating the reasoning.
 
-Nothing in CLAUDE.md yet describes any of this. Add:
-- reasoning synthesis + its two invariants; that `oracle_rationale` is now meaningful
-  and what it costs in supervised tokens (7.60% → 14.97%)
-- `real_chains.py`: the resolution strategy and each gate's measured cost
-- `psychic_caps` as the single shared definition, and the function-word finding
-- audit axis 5, and that the audit's headline is now five axes not four (the module
-  docstring still says "the three defects" / "The three axes")
-- that `data/musique_chain_tasks.jsonl` inherits judge-disjointness from
-  `musique_train_tasks.jsonl` because it only rewrites plans and never resamples
+One number worth knowing before you pick the mix: 0.35 spends only **184 of the 282**
+real 4-hop rows. Taking all of them means `--real-frac 0.46`, which is the entire real
+pool.
 
-## Recommended mix — and the open question
+Both sets pass `scripts/lib_data_gate.sh::require_clean_dataset`, so
+`DATA=data/sft_r35.jsonl bash scripts/50_sft_4b.sh` runs without an override.
 
-**My recommendation: `--real-frac 0.35`, with the real slice left un-rebalanced.**
+### 4. Sequence lengths — nothing is dropped
 
-Reasoning. Real prose is the gap the judge score is measuring — synthetic 2-hop sits near
-100% while the real 2-hop rows sit at 46.4%, and the whole synthetic-to-real delta is what
-the 4B's 75/37/21 gradient is made of. But real supply is **2009 records against ~2280
-synthetic**, and it is thinnest exactly where the model is weakest: **only 335 real 4-hop**
-(16.7% of the real pool) versus 684 synthetic 4-hop. At 0.35 you get roughly 1080 synthetic
-+ 580 real, which spends most of the real 4-hop supply while keeping synthetic as the
-volume source for the hop families where it is cheap.
+Measured with the real `Qwen/Qwen3-4B` tokenizer through `assistant_spans`, i.e. the
+exact path `atr/train/sft.build_dataset` takes, reproducing its drop rule
+(`len(ids) > max_len or not spans`).
 
-The open question I could not settle for you: **do not rebalance the real slice to 40/30/30.**
-Doing so caps the whole real slice at `335 / 0.30 ≈ 1116` records and throws away ~800
-real 2-hop rows to buy nothing — the 4-hop count is fixed at 335 either way. Taking the real
-pool as-is (57/27/17) and letting the synthetic side carry the hop balance gets you every
-real 4-hop row AND more real prose. That is what `--real-hop-mix ""` (the default) does.
+| set | mean | max | p90 | p99 | supervised | > 4096 |
+|---|---|---|---|---|---|---|
+| `data/sft.jsonl` (no reasoning) | 1360 | 1723 | 1653 | 1691 | 103 (7.59%) | **0** |
+| `data/sft_r0.jsonl` | 1476 | 1872 | 1793 | 1837 | 220 (14.87%) | **0** |
+| `data/sft_r35.jsonl` | 1573 | 3707 | 1937 | 2929 | 197 (12.50%) | **0** |
 
-The real risk is the opposite one and it is not addressable by mixing: 335 4-hop real
-trajectories may simply be too few to move 4-hop, and the honest test is an ablation —
-build at 0.0 / 0.35 / 0.60 and read `final_f1` per hop on the judge probe. Worth one GPU
-afternoon before committing to a mix.
+Nothing is dropped by `--max-len 4096` and nothing exceeds it; the longest record in
+either new set is 3707 tokens, and that tail is entirely real 4-hop (real mean 1754 /
+max 3707 vs synthetic 1476 / 1872) — MuSiQue's 20 candidate passages are longer than a
+synthetic world's. The `r35` supervised FRACTION is lower than `r0`'s (12.50% vs
+14.87%) purely because real records are longer, not because they are less supervised.
 
-## State of the tree
+### 5. Test, docs, gate — DONE
 
-CPU gate green after the changes: `test_pipeline`, `test_parser`, `test_fix2`,
-`test_answer_f1` all PASS, and the committed `data/sft.jsonl` still audits **CLEAN** under
-the new five-axis auditor (it has no `<think>` blocks, so axis 5 is 0 — that is a
-consistency check, not evidence the axis works; the smoke build is what exercises it).
+`tests/test_real_chains.py` (new, 13 checks, house style): index fidelity 25/25 against
+the shipped BM25; one pinned rejection per axis plus a pinned acceptance; the three
+smoke regressions pinned both ways; every query in the committed pool re-checked for
+writability; pool plan shape (`len(oracle_plan) == len(route)`, no terminal read — the
+synthetic `+1` rule must never be pointed here); `tidy_query` never changes a BM25 token
+over all 11,500 source queries, with a non-vacuity check; determinism over a 300-row
+slice; and the reasoning invariants — never names `chain[k+1]`, and no template opens a
+sentence with a bare entity.
 
-`data/sft.jsonl` is **untouched** — still the 2280-record v3 set. Nothing here has been
-promoted into the training path.
+**That last one failed when first written, and the template was wrong, not the test.**
+`_SYN_FIRST[1]` was `"Starting point: {head}. …"` — `psychic_caps(prose=True)` treats a
+colon as a sentence boundary and skips what follows, so a bare name parked there is
+invisible to the auditor. It never produced a defect (a synthetic head entity is always
+named by the prompt), but the invariant is precisely what the auditor's blind spot is
+traded against. Changed to `"My starting point is {head}. …"`; both datasets were
+rebuilt after the change, which is why the numbers above are from the second build.
+`{goal}` remains the documented exemption — it expands to the hop's own query, which
+`real_chains` has already gated.
+
+Also: `audit_sft.py`'s docstring now documents five axes (it said "three"), the data
+gate's refusal message lists the fifth, and `schema.psychic_caps` pointed at a
+`tests/test_reasoning.py` that was never written — it points at `test_real_chains.py`.
+
+CPU gate green: `test_pipeline`, `test_parser`, `test_fix2`, `test_answer_f1`,
+`test_shortcut_filter`, `test_naturalize`, `test_grpo_resume`, `test_source_split`,
+`test_lora_rank`, `test_real_chains`, `test_curriculum_feedback`, `test_planb` all exit
+0, and `eval --dev --backend oracle` is 100% at every difficulty.
+
+## The 8.00% question, answered
+
+**The reading I used:** a chosen `#N` substitution *shares at least one content token
+with the query of the hop it was drawn from*, where "content token" is
+`real_chains.content_tokens` — unicode-folded, function words dropped, tokens of 1–2
+chars dropped. That is the `subject_rule="overlap"` predicate exactly. The `subset`
+default is the weaker sibling: reject only when EVERY token of the candidate is already
+in that query.
+
+**The 8.00% is not reproducible and I no longer stand behind it.** Re-measured on the
+current tree by recovering every chosen substitution from the resolved queries:
+**114 / 4230 = 2.70%** over all attempted rows, **76 / 3020 = 2.52%** over kept rows.
+The second is the "2.41% in the leak-free set" from the first session, moved by the new
+gate. The first is not 8.00%, and the gap is a denominator: 7525 is the count of `#N`
+placeholders in all 3975 raw plans, including every hop of every row that was rejected
+before reaching it — substitutions that were never chosen. 4230 is the count actually
+chosen. A rate whose numerator counts decisions and whose denominator counts
+opportunities is not a rate. **So: ~2.5–2.7% under the reading above, and neither your
+4.5% nor my 8.00% is a number this corpus produces.** If 4.5% came from a different
+predicate, `ChainConfig.subject_rule` is still where it goes.
+
+**Does the alternative change the built set materially? No — and its direction is
+wrong.** Full-pool comparison, both with the new hop-2+ gate on:
+
+| | kept | 2-hop | 3-hop | 4-hop |
+|---|---|---|---|---|
+| `subset` (default) | 1935 | 1132 | 521 | 282 |
+| `overlap` | 1911 | 1120 | 511 | 280 |
+
+32 rows only in `subset`, 8 only in `overlap`, 1903 shared — and **46 of the shared
+rows resolve to a DIFFERENT name**, which is the part that matters more than the count.
+Traced live:
+
+    2hop__128478_11424
+      hop 1: "What city is WAYV located?"          -> Atlantic City
+      subset  hop 2: "How many households were there in Atlantic City during the 2010 … Census?"
+      overlap hop 2: "How many households were there in New Jersey during the 2010 … Census?"
+
+`overlap` refuses "Atlantic City" because `city` is shared with hop 1's query, and
+substitutes "New Jersey" instead — a WRONG resolution that still clears the occurs gate,
+because New Jersey is named in the same passage. MuSiQue nests place names constantly,
+so this is the common case, not a corner.
+
+The unicode folding, re-checked with the function-word filter held constant, changes the
+overlap verdict on **0 of 4230** chosen substitutions — the first session's "0 of 7524"
+reproduces. It stays in as insurance against a name distribution, not as a fix for one.
+(A first pass at this comparison said 15; that probe dropped short tokens but not
+function words, so it was measuring `the`, not diacritics.)
+
+## What is actually left
+
+- **Run the ablation.** Three arms exist and are one flag apart: `data/sft.jsonl`
+  (no reasoning), `data/sft_r0.jsonl` (reasoning, synthetic only), `data/sft_r35.jsonl`
+  (+35% real). Read `final_f1` PER HOP on the 54-row judge probe, not the headline — the
+  4B's 75.4 / 37.4 / 21.1 gradient is the thing under test, and 184 real 4-hop
+  trajectories may simply be too few to move the last number. That is a measurement, not
+  a mixing problem, and no `--real-frac` fixes it.
+- **`--real-frac 0.46`** is the point at which the real pool is exhausted, if the 4-hop
+  arm looks starved.
+- The two run-tooling issues in CLAUDE.md's "Open issues" section are untouched: the
+  committed SSH password still needs ROTATING (deleting the lines is not sufficient),
+  and `60_pipeline_tomorrow.sh` still passes `--eval-every 50` alongside `--save-every 5`.

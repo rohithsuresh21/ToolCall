@@ -1,9 +1,9 @@
-"""Audit a built SFT jsonl for the three defects that the oracle score cannot see.
+"""Audit a built SFT jsonl for the five defects that the oracle score cannot see.
 
     python tests/audit_sft.py data/sft.jsonl
 
 Point it at ANY built set -- including one built on a remote GPU box -- to settle
-whether it came from the corrected generator. The three axes:
+whether it came from the corrected generator. The five axes:
 
 1. PSYCHIC FIRST QUERY. The first search must be writable from the question alone.
    A first query naming a proper noun absent from the prompt means the plan was
@@ -27,6 +27,17 @@ whether it came from the corrected generator. The three axes:
    of the disconnection shortcut and the single-search filter cannot see it --
    before `_is_prefix_leaky`, 51.9% of generated 4-hop tasks (41.6% at 2 and 3
    hops) were answerable in fewer hops than their label claimed.
+
+5. PSYCHIC <think>. A synthesised reasoning block naming a proper noun absent
+   from the prompt AND from every STRICTLY EARLIER tool response. Same defect as
+   axis 1 and strictly worse: an invented query is at least scored by retrieval,
+   whereas invented deliberation is teacher-forced hallucination. It is read with
+   `psychic_caps(prose=True)`, which ignores sentence-initial capitals -- in
+   running prose the first word is capitalised whatever it is -- so no template in
+   atr/data/reasoning.py may put a bare entity name there, and
+   tests/test_real_chains.py pins that. This axis is what caught the hop-2+
+   psychic queries in real MuSiQue chains that
+   `ChainConfig.require_writable_first_query` alone let through.
 
 Also reported: the answer-diversity of each hop family.
 

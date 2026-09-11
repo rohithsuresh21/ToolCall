@@ -127,7 +127,8 @@ require_clean_dataset() {
     echo "  REFUSING TO TRAIN: $data reports DEFECTS PRESENT." >&2
     echo "" >&2
     echo "  Any of: psychic first query, gold answer never retrieved, conflicting" >&2
-    echo "  labels, or per-hop prefix leakage. A model trained on this scores fine" >&2
+    echo "  labels, per-hop prefix leakage, or a psychic <think> block. A model" >&2
+    echo "  trained on this scores fine" >&2
     echo "  under the oracle and teaches truncated chains. Rebuild from the current" >&2
     echo "  generator before spending GPU time:" >&2
     echo "    bash scripts/10_build_data.sh" >&2

@@ -54,18 +54,34 @@ Then the chain itself has to be worth training on:
               the answer routinely turns up before the chain has been walked, the
               chain is truncatable, a model that stops early is still scored right,
               and that is what it learns.
-  first query writable
-              hop 1's query must name no proper noun absent from the question. This
-              is axis 1 of tests/audit_sft.py stated as a build-time filter instead
-              of a post-hoc complaint -- MuSiQue's own decomposition sometimes opens
-              on an entity the question never names, and such a row is unlearnable
-              for the same reason a psychic synthetic plan was. Both sides call
-              `schema.psychic_caps`, ONE definition, so a set cannot be built
-              against one rule and judged against another.
+  every query writable
+              no hop's query may name a proper noun the episode has not been shown.
+              This is axis 1 of tests/audit_sft.py stated as a build-time filter
+              instead of a post-hoc complaint -- MuSiQue's own decomposition
+              sometimes opens on an entity the question never names, and such a row
+              is unlearnable for the same reason a psychic synthetic plan was. Both
+              sides call `schema.psychic_caps`, ONE definition, so a set cannot be
+              built against one rule and judged against another.
 
-MEASURED YIELD at top_k=3, defaults: 2009 of 3975 rows (50.5%), split 1138 / 536 /
-335 across 2/3/4 hops. Rejections, per axis: 1342 substitution-not-in-evidence, 456
-no-new-evidence, 122 gold-leaks-early, 46 psychic-first-query.
+              It is TWO gates, not one, because they reject different populations.
+              Hop 1 (`require_writable_first_query`) is checked against the question
+              alone: it catches a decomposition whose entry point is an entity the
+              asker never supplied. Hops 2+ (`require_writable_later_queries`) are
+              checked against the question PLUS the prose of every strictly earlier
+              hit: they catch a sub-question that assumes a name retrieval has not
+              surfaced ("Where are the villages of Wengen and Zermatt located?",
+              where the chain reveals Zermatt and nothing reveals Wengen). Only the
+              first gate existed until 2026-09-11, and 3 of 325 records in the first
+              combined smoke build tripped the auditor's <think> axis because of it
+              -- the synthesised reasoning quotes the resolved sub-question, so a
+              psychic query surfaces as psychic deliberation.
+
+MEASURED YIELD at top_k=3, defaults: 1935 of 3975 rows (48.7%), split 1132 / 521 /
+282 across 2/3/4 hops. Rejections, per axis: 1310 substitution-not-in-evidence, 451
+no-new-evidence, 119 gold-leaks-early, 115 psychic-query-hop2+, 45 psychic-first-query.
+(Before the hop-2+ gate: 2009 rows / 50.5%, split 1138 / 536 / 335. It costs 74 rows,
+53 of them 4-hop -- the thinnest family paying the most, because a longer chain has
+more hops that can assume a name.)
 
 The 4-hop tail is thin by construction -- the gates that make a 4-hop chain
 trainable are the same ones a 4-hop chain is most likely to fail -- and that
@@ -223,6 +239,16 @@ class ChainConfig:
     top_k: int = 3
     require_leak_free: bool = True
     require_writable_first_query: bool = True
+    # Same rule as require_writable_first_query, applied to hops 2..L against the
+    # prompt PLUS every strictly-earlier hop's retrieved text. The first-query gate
+    # alone let 3 of 325 smoke records through: MuSiQue's own sub-question for a
+    # later hop can open on a proper noun ("Wengen", "All Saints Church") that the
+    # question never names and no earlier passage returned, so the resolved query
+    # is writable only by someone who already read the answer key. Kept as its own
+    # flag with its own rejection key because it rejects a DIFFERENT population
+    # from hop 1's: hop 1 fails on the decomposition's entry point, hops 2+ fail on
+    # retrieval not having surfaced a name the sub-question assumes.
+    require_writable_later_queries: bool = True
     require_full_coverage: bool = False   # every supporting passage retrieved
     # How hard to reject a substitution that restates hop N's own subject.
     #   "subset"  -- reject only when EVERY token of the candidate is already in
@@ -260,6 +286,12 @@ def _resolve(row: dict, cfg: ChainConfig) -> ChainResult:
 
     env: dict[int, str] = {}
     hop_hits: list[list[int]] = []
+    # What the EPISODE has seen before the current hop: the question, then the
+    # prose of every strictly earlier hit. psychic_caps lowercases and substring-
+    # matches, and idx.blob is norm_text of `title + " " + text` -- the same two
+    # pieces tests/audit_sft.py concatenates for its <think> axis, so the gate and
+    # the auditor read the same context rather than two dialects of it.
+    seen_ctx = row["prompt"]
     # chain[k] = the name call k-1 revealed AND call k substitutes. Only filled
     # when call k references the IMMEDIATELY preceding hop, so "the result names X"
     # is literally true rather than approximately true; see reasoning._reveals.
@@ -335,10 +367,18 @@ def _resolve(row: dict, cfg: ChainConfig) -> ChainResult:
         if not new:
             res.reason = f"no_new_evidence_hop{k + 1}"
             return res
+        tq = tidy_query(query)
+        # Hop 1 is gated once at the end, against the prompt alone; see
+        # require_writable_first_query. A row that fails both is counted here,
+        # because this is the check that fires first.
+        if cfg.require_writable_later_queries and k > 0 and psychic_caps(tq, seen_ctx):
+            res.reason = f"psychic_query_hop{k + 1}"
+            return res
         for h in new:
             unused.discard(h)
-        res.queries.append(tidy_query(query))
+        res.queries.append(tq)
         hop_hits.append(hits)
+        seen_ctx += " " + " ".join(idx.blob[h] for h in hits)
 
     if cfg.require_full_coverage and unused:
         res.reason = "support_not_covered"

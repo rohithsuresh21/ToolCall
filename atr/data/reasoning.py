@@ -74,9 +74,21 @@ _ATTR_PHRASE = {
 # --- templates -------------------------------------------------------------
 # Three per position. More would be cheap but pointless: the variation exists to
 # stop the string being memorised verbatim, not to model natural language.
+#
+# No template may put a BARE ENTITY NAME ({head}/{prev}/{leaf}/{ans}) where a
+# sentence starts -- including after a colon, which psychic_caps(prose=True)
+# treats as a sentence boundary. That reader ignores sentence-initial capitals
+# because in running prose the first word is capitalised whatever it is, so a
+# one-word invented entity parked there is invisible to the auditor. "Starting
+# point: {head}." did exactly that; it never produced a defect, because a
+# synthetic head entity is always named by the prompt, but the invariant is what
+# the auditor's blind spot is traded against and it has to actually hold.
+# test_real_chains.test_no_template_opens_a_sentence_with_a_bare_entity pins it.
+# {goal} is exempt: it expands to the hop's own query, which real_chains gates
+# against everything the episode has seen.
 _SYN_FIRST = [
     "The question names {head}. To get anywhere I first need {goal}.",
-    "Starting point: {head}. Step one is to find {goal}.",
+    "My starting point is {head}. Step one is to find {goal}.",
     "The only entity the question gives me is {head}, so I need {goal} first.",
 ]
 _SYN_HOP = [

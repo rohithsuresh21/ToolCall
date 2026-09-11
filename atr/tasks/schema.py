@@ -180,7 +180,7 @@ def psychic_caps(query: str, prompt: str, prose: bool = False) -> list[str]:
     the entity itself, which is exactly what the check must still see. The cost of
     `prose=True` is that a one-word invented entity opening a sentence would be
     missed -- which is why no template in atr/data/reasoning.py opens a sentence
-    with an entity, and why tests/test_reasoning.py asserts that it never does."""
+    with an entity, and why tests/test_real_chains.py asserts that it never does."""
     low = (prompt or "").lower()
     out = []
     for m in re.finditer(r"[A-Za-z]+", query or ""):
