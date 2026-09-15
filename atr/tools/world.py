@@ -31,13 +31,29 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 # --- surface-form pools (span across the encyclopedic domains, not logistics) --
+# Vocabulary size is the CEILING on the training set, not a cosmetic choice. A
+# question names only its HEAD entity, so the number of distinct questions a
+# route can mint is exactly the head kind's name vocabulary; see the note in
+# generator.py. These lists were 24x20 (=480 people) and 14x8 (=112 orgs), which
+# capped the balanced synthetic set at ~5,080 records however many seeds were
+# drawn. Widened 4x on both axes. Append to these rather than reordering: the
+# pools are consumed through rng.choice, so ANY change to length or order
+# re-points every seed (same hazard as generator._variant_rng).
 PERSON_FIRST = ["Ada", "Bo", "Chen", "Divya", "Eli", "Farid", "Gita", "Hana",
                 "Ivan", "Jae", "Kira", "Luca", "Mei", "Noor", "Omar", "Priya",
-                "Rhea", "Sam", "Tariq", "Uma", "Vik", "Wren", "Xin", "Yara"]
+                "Rhea", "Sam", "Tariq", "Uma", "Vik", "Wren", "Xin", "Yara",
+                "Anya", "Bilal", "Camila", "Dario", "Esme", "Fiona", "Gabor",
+                "Hugo", "Ines", "Jonas", "Kenji", "Leila", "Marta", "Nadia",
+                "Otto", "Pavel", "Quentin", "Rosa", "Soren", "Tessa", "Ulla",
+                "Viktor", "Wanda", "Zara"]
 PERSON_LAST = ["Alvarez", "Bakshi", "Cortez", "Dumas", "Eriksen", "Fontaine",
                "Gupta", "Haddad", "Ibrahim", "Jensen", "Kowalski", "Lindqvist",
                "Moreau", "Nakamura", "Okafor", "Petrov", "Rossi", "Silva",
-               "Tanaka", "Vasquez"]
+               "Tanaka", "Vasquez",
+               "Andersen", "Bergman", "Castillo", "Duarte", "Espinoza", "Falk",
+               "Grimaldi", "Halvorsen", "Iqbal", "Jovanovic", "Karlsson",
+               "Laurent", "Mbeki", "Novak", "Oyelaran", "Pereira", "Quiroga",
+               "Reyes", "Sorensen", "Varga"]
 
 NATIONS = [
     ("Khaldonia", "Meridian City", "eastern"), ("Vestorland", "Osthavn", "northern"),
@@ -49,10 +65,17 @@ GEO_FEATURES = ["Aurora Peaks", "Sable River", "Emerald Gorge", "Cobalt Bay",
 GEO_KIND = ["mountain range", "river", "canyon", "bay", "highland", "delta",
             "mountain range", "coastline"]
 
+# "Meridian" is deliberately absent: it is a NATIONS capital ("Meridian City"),
+# and an org sharing that token would make the title boost fire on the wrong
+# passage for city-hop queries.
 ORG_WORDS = ["Vertex", "Nimbus", "Quartz", "Ember", "Delta", "Onyx", "Prism",
-             "Cobalt", "Solstice", "Zenith", "Argon", "Boreas", "Comet", "Drift"]
+             "Cobalt", "Solstice", "Zenith", "Argon", "Boreas", "Comet", "Drift",
+             "Halcyon", "Ironwood", "Juniper", "Krypton", "Lumen", "Nebula",
+             "Obsidian", "Pinnacle", "Quasar", "Radian", "Summit", "Tundra",
+             "Umbra", "Vanguard"]
 ORG_KIND = ["Aeronautics", "Dynamics", "Biotech", "Energy", "Mining", "Logistics",
-            "Pharma", "Telecom"]
+            "Pharma", "Telecom", "Robotics", "Materials", "Analytics", "Maritime",
+            "Chemicals", "Semiconductors", "Instruments", "Systems"]
 FIELD = ["aerospace engineering", "biotechnology", "renewable energy", "mineral extraction",
          "telecommunications", "logistics"]
 

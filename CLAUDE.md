@@ -621,7 +621,7 @@ realisations, undoing the change with no error anywhere.
 - `artifacts/` is gitignored except `artifacts/sft_sample.jsonl`. Committed data lives in
   `data/sft.jsonl`, `data/judge_tasks.jsonl`, `data/musique_train_tasks.jsonl` and
   `data/musique_chain_tasks.jsonl`. SFT records are `{messages, tools, meta}` JSONL, UTF-8.
-- **Five committed SFT sets, and the difference between them is ONE variable each.**
+- **Six committed SFT sets, and the difference between them is ONE variable each.**
   `data/sft.jsonl` (2280 records) is the v3 set with NO reasoning — the pre-`<think>`
   baseline. `data/sft_r0.jsonl` (2280) is the same synthetic population WITH `<think>`, and
   `data/sft_r35.jsonl` (3508 = the identical 2280 synthetic + 1228 real at 35.0%) adds real
@@ -654,6 +654,38 @@ realisations, undoing the change with no error anywhere.
   bonus is that the whole real pool is spent, all 282 real 4-hop rows included, which 0.35 at
   the smaller scale did not manage. Real hop mix un-rebalanced at 1131 / 520 / 282. Recompute
   this fraction if either pool size changes; a round 0.35 is the wrong number here.
+- **`data/sft_r0_max.jsonl` (8880) is the only set built against the WIDENED name pools, and
+  that makes it a different WORLD, not just a bigger sample.** `PERSON_FIRST` x `PERSON_LAST`
+  went 24x20 -> 48x40 and `ORG_WORDS` x `ORG_KIND` 14x8 -> 28x16, so person names go 480 ->
+  1920 and org names 112 -> 448. Both pools are consumed through `rng.choice` inside
+  `build_world`, so changing their LENGTH re-points the whole stream: **every seed now mints a
+  different task**, and `sft.jsonl` / `r0` / `r35` / `r0_big` / `r35_big` can no longer be
+  reproduced by re-running their build commands. They remain valid as committed artifacts and
+  as arms of the ablations they were built for; they are simply no longer regenerable, and a
+  set built now must not be compared against them as if only the record count had changed.
+  The dev (900k+) and GRPO (1M-1.4M) seed ranges are unaffected as RANGES, but the dev worlds
+  they build have changed too, so a canary number from before this commit is not comparable
+  either.
+- **The synthetic ceiling is head-entity VOCABULARY, and it is ~4x the record count you want.**
+  A question names only its HEAD entity (`"What is the {attr} of {nested phrase}({head})?"`),
+  relation phrases being fixed templates, so the distinct-question capacity of a route is
+  exactly its head kind's name vocabulary, and the set ceiling is
+  `min over families (capacity_f / target_share_f)`. At 24x20 / 14x8 that was **5,080 records**
+  (2-hop binding, capacity 2032 at a 40% share) and no number of seeds could pass it: 6000
+  seeds gave 2280, 20000 gave 4027, 50000 gave 4907 = 97% of the ceiling. At 48x40 / 28x16 it
+  is **20,080**. Two things do NOT cap it: `max_per_shape` (2000) never binds -- the largest
+  real route bucket was 732 -- and the route pool's size matters only as a multiplier on the
+  vocabularies. Diagnose a plateau by computing this capacity, never by adding seeds.
+  `leaf=country` + `population` is dead on every route (it leaks through the capital's passage,
+  same number by construction) and is excluded from the capacity arithmetic; recovering it
+  would be worth ~+590 to the binding family.
+- **Yield per seed falls steeply, so size a build from capacity and not from a seed ratio.**
+  Calibrated on the old pools, 2-hop reached 45% / 79% / 97% of capacity at roughly 1.2x / 3.9x
+  / 9.8x oversampling (draws per unit capacity). `sft_r0_max` was sized from that curve: 24000
+  seeds for ~9,016 records, and it landed on 8880 with 2-hop 44% saturated against the
+  predicted 45%. Chasing the full 20,080 needs ~198k seeds AND produces a ~111 MB file, which
+  GitHub rejects outright at its 100 MB hard limit -- past ~15,900 records a plain committed
+  jsonl is no longer an option and the set needs Git LFS.
 - **Training inputs come from `data/`, never `artifacts/`, and the gate enforces it.**
   `20_sft.sh` and `50_sft_4b.sh` source `scripts/lib_data_gate.sh` and call
   `require_clean_dataset`, which runs `tests/audit_sft.py` and refuses to start on
