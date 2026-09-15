@@ -621,7 +621,7 @@ realisations, undoing the change with no error anywhere.
 - `artifacts/` is gitignored except `artifacts/sft_sample.jsonl`. Committed data lives in
   `data/sft.jsonl`, `data/judge_tasks.jsonl`, `data/musique_train_tasks.jsonl` and
   `data/musique_chain_tasks.jsonl`. SFT records are `{messages, tools, meta}` JSONL, UTF-8.
-- **Three committed SFT sets, and the difference between them is ONE variable each.**
+- **Five committed SFT sets, and the difference between them is ONE variable each.**
   `data/sft.jsonl` (2280 records) is the v3 set with NO reasoning — the pre-`<think>`
   baseline. `data/sft_r0.jsonl` (2280) is the same synthetic population WITH `<think>`, and
   `data/sft_r35.jsonl` (3508 = the identical 2280 synthetic + 1228 real at 35.0%) adds real
@@ -633,6 +633,27 @@ realisations, undoing the change with no error anywhere.
   Train `--data` at whichever arm you are reading;
   do not rebuild one arm without rebuilding both, since a template or gate change moves the
   population under all of them.
+- **The `_big` arms are the same ablation at 1.77x scale, and the scale step is smaller than
+  the seed step because the question space SATURATES.** `data/sft_r0_big.jsonl` (4027) and
+  `data/sft_r35_big.jsonl` (5960 = the identical 4027 synthetic + all 1933 real) are built by
+  the same generator, templates, gates and reasoning blocks as `r0`/`r35`; only `--n` changed,
+  from 6000 seeds to 20000. Yield per seed FALLS as the set grows — 6000 seeds gave 2280
+  records (0.38/seed), 20000 gave 4027 (0.20/seed) and a 50000-seed probe gave 4907
+  (0.10/seed) — because the entity pools are small (10 people, 8 orgs, 6 cities/countries),
+  so distinct question strings run out and `dedupe_by_question` drops the rest. **Do not plan a
+  build by multiplying a target record count by a seed ratio**; ~6000 synthetic records is not
+  reachable from this world generator by adding seeds alone, and would need wider entity pools.
+- **`sft_r35_big` is built at `--real-frac 0.324329`, and that number is load-bearing.** At
+  4027 synthetic the binding constraint flips: 0.35 would want 2168 real records against a pool
+  of 1933, so `11_build_combined.py` takes the real side whole and TRUNCATES synthetic to 3590
+  — which would confound the arms with 437 missing synthetic records on top of the real slice.
+  0.324329 is the exact ratio at which both pools are taken whole (`by_real[1] == 4027`, so the
+  `<=` branch fires with everything), making the synthetic slice byte-identical AND complete, so
+  `r0_big` vs `r35_big` isolates the real data and nothing else — verified by set-comparing the
+  raw lines: 4027/4027 of `r0_big` present verbatim, delta exactly the 1933 real records. The
+  bonus is that the whole real pool is spent, all 282 real 4-hop rows included, which 0.35 at
+  the smaller scale did not manage. Real hop mix un-rebalanced at 1131 / 520 / 282. Recompute
+  this fraction if either pool size changes; a round 0.35 is the wrong number here.
 - **Training inputs come from `data/`, never `artifacts/`, and the gate enforces it.**
   `20_sft.sh` and `50_sft_4b.sh` source `scripts/lib_data_gate.sh` and call
   `require_clean_dataset`, which runs `tests/audit_sft.py` and refuses to start on
