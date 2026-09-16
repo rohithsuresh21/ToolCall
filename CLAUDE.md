@@ -32,6 +32,7 @@ python tests/test_naturalize.py        # naturalization with a mock LLM (offline
 python tests/test_grpo_resume.py       # GRPO checkpoint/resume/wall-clock stop (CPU, no model)
 python tests/test_source_split.py      # per-source (synthetic/real) GRPO group accounting
 python tests/test_real_chains.py       # MuSiQue #N resolution gates + synthesised <think> invariants
+PYTHONPATH=. python tests/test_recovery.py  # STeCa recovery splice: genuine miss, <think> invariants, determinism
 python tests/audit_sft.py data/sft.jsonl  # built-set audit, FIVE axes: psychic first query, unretrieved/early
                                           # answers, label conflicts, psychic <think>
 python tests/verify_dataset.py         # needs artifacts/naturalized_passages_scaled.json
@@ -53,6 +54,15 @@ python scripts/11_build_combined.py --n 6000 --real-frac 0.35 --out artifacts/sf
 python scripts/11_build_combined.py --n 6000 --real-frac 0.0  --out artifacts/sft_r0_candidate.jsonl  --promote-to data/sft_r0.jsonl
 # --no-promote leaves the candidate in artifacts/ for inspection; the script REFUSES to
 # promote a set the auditor calls DEFECTS PRESENT. --no-reasoning is the pre-<think> baseline.
+
+# the two arms built ON TOP of sft_r0_max (each transforms it; neither re-draws it)
+python scripts/12_build_recovery.py  --out data/sft_r0_max_rec.jsonl   # ~10% STeCa recovery
+python scripts/13_rebalance_4hop.py  --out data/sft_r0_max_4h.jsonl    # mix 40/30/30 -> 25/30/45
+# 13_ prints the per-family distinct-question CAPACITY first and refuses a share that
+# exceeds it; both audit their output and both are byte-identical across runs.
+
+# tokens/example with the real Qwen3-4B tokenizer and this repo's own renderer
+python scripts/token_stats.py data/sft_r0_max_rec.jsonl --spans   # --spans adds the masking check
 
 # GPU stages (bash scripts; env vars MODEL/ADAPTER/OUT/DATA override defaults)
 scripts/20_sft.sh   scripts/30_grpo.sh   scripts/40_eval.sh   scripts/60_merge_export.sh
@@ -314,6 +324,43 @@ changed; it never produced a defect (a synthetic head entity is always named by 
 but the invariant is what the auditor's blind spot is traded against, so it has to hold.
 `tests/test_real_chains.py` pins it, and `{goal}` is the documented exemption — it expands to
 the hop's own query, which `real_chains` has already gated.
+
+**`recovery.py` is the STeCa arm: a step that goes wrong on purpose and is then repaired, and
+the miss has to be REAL.** `ScoreCard.recovery_ok` and `reward.w_recovery` shipped in the first
+commit with zero data behind them — an oracle replay never makes a bad call, which is why
+`eval --backend oracle` prints `recovered after error  --`. The evidence that it matters: of 18
+failed 4-hop judge tasks, **4 hit `max_steps` carrying an EMPTY answer**, i.e. they looped
+rather than answered wrong. `build_recovery` takes a chain that already cleared all four gates,
+replaces ONE hop's query with a plausible bad one, EXECUTES it against the same BM25 tool, and
+splices in the real tool_response plus a `<think>` block that names the miss and a different
+approach. No teacher is needed because the generator already knows the correct query.
+
+**A query carrying the source entity's name cannot miss in this world**, and that is the
+constraint the whole module is shaped by: `search` boosts a title match 1.6x, so any such query
+returns the source's own passage — the passage that names the next hop. A "wrong keyword on the
+right entity" therefore retrieves exactly what the hop needed, and splicing a recovery onto it
+would teach re-querying while already holding the answer, which IS the loop. So every candidate
+is executed and kept only if no returned passage carries the gold answer (otherwise audit axis 4
+fires too) and none names the entity the next hop is written from. `_FLAVOURS` proposes, the
+tool disposes, and the realised mix is an OUTPUT of the build: on `sft_r0_max_rec`,
+**wrong_entity 42.9% / conversational 33.5% / absent_entity 23.6% / wrong_keyword 0%** — the
+last never survives, for exactly the reason above, and is kept in the table as the record of it.
+Only 3.6% of the misses come back EMPTY; the rest return three plausible, useless passages,
+which is the harder signal and the one the looping judge trajectories actually faced.
+**Consequence worth knowing before reading a GRPO log: `verifiers.score` only detects a recovery
+from a tool error or a `num_results == 0` retrieval, so it still scores `recovery_ok = None` on
+~96% of these.** The SFT signal is there; the metric that would measure it is not, yet.
+
+Two things carry over unchanged from `reasoning.py` and one is new. The recovery `<think>` obeys
+the same **name-only-what-the-episode-has-seen** invariant, and note that the auditor builds
+"seen" from tool_responses ONLY — so material the assistant invented (an absent entity name in
+the bad query itself) is not seen, and no template may quote the bad query back. Phrasing is
+`sha1(task_id|step)`, so a rebuild is byte-identical. The new one: **hop 0 is never corrupted**,
+because a bad FIRST query is the psychic-first-query defect (audit axis 1) and is also the one
+hop with no earlier result to recover onto. The accepted cost of the construction is that the
+`<think>` before the bad call states the CORRECT intent and the call then slips — every
+reasoning token supervised is true, and what the pair teaches is to check a result against the
+intent that asked for it. `tests/test_recovery.py` pins all of it on live episodes.
 
 **`real_chains.py` turns MuSiQue's decomposition into an executable plan, and every gate it
 applies is about what an EPISODE can see.** `question_decomposition` is a sketch: 59.3% of its
@@ -621,7 +668,7 @@ realisations, undoing the change with no error anywhere.
 - `artifacts/` is gitignored except `artifacts/sft_sample.jsonl`. Committed data lives in
   `data/sft.jsonl`, `data/judge_tasks.jsonl`, `data/musique_train_tasks.jsonl` and
   `data/musique_chain_tasks.jsonl`. SFT records are `{messages, tools, meta}` JSONL, UTF-8.
-- **Six committed SFT sets, and the difference between them is ONE variable each.**
+- **Eight committed SFT sets, and the difference between them is ONE variable each.**
   `data/sft.jsonl` (2280 records) is the v3 set with NO reasoning — the pre-`<think>`
   baseline. `data/sft_r0.jsonl` (2280) is the same synthetic population WITH `<think>`, and
   `data/sft_r35.jsonl` (3508 = the identical 2280 synthetic + 1228 real at 35.0%) adds real
@@ -666,11 +713,32 @@ realisations, undoing the change with no error anywhere.
   The dev (900k+) and GRPO (1M-1.4M) seed ranges are unaffected as RANGES, but the dev worlds
   they build have changed too, so a canary number from before this commit is not comparable
   either.
+- **`sft_r0_max_rec` and `sft_r0_max_4h` are TRANSFORMS of `sft_r0_max`, not rebuilds of it,
+  and that is what makes them one-variable arms.** A fresh `generate()` run cannot isolate a
+  variable here: the family is drawn per index from one `random.Random(rng_seed)` stream, so
+  re-weighting the mix re-points the whole draw, and the filters re-evaluate on top of that. So
+  both scripts read the base set back and keep every carried record BYTE-IDENTICAL.
+  `data/sft_r0_max_rec.jsonl` (8880) converts 898 of them (10.1%) to recovery trajectories —
+  5% / 12% / 15% by hop family, weighted at the long chains where the looping is — leaving
+  **7982 lines verbatim** and adding exactly two messages to each converted record; count, hop
+  mix, task ids and questions are unchanged, so `r0_max` vs `r0_max_rec` isolates recovery.
+  `data/sft_r0_max_4h.jsonl` (8880) shifts the mix 40/30/30 -> **25/30/45** at the same record
+  count: every 3-hop and every 4-hop base record is kept, the 2-hop surplus is dropped, and the
+  1332 missing 4-hop records are minted from seeds 100k+ — **7548 lines verbatim, delta exactly
+  1332 new 4-hop**. Both audit CLEAN on all five axes and both are byte-identical across two
+  full runs. The 2-hop slice of `_4h` is a deterministic hash-ordered subset of `r0_max`'s, so
+  it is a sub-sample and not a re-draw.
 - **The synthetic ceiling is head-entity VOCABULARY, and it is ~4x the record count you want.**
   A question names only its HEAD entity (`"What is the {attr} of {nested phrase}({head})?"`),
-  relation phrases being fixed templates, so the distinct-question capacity of a route is
-  exactly its head kind's name vocabulary, and the set ceiling is
-  `min over families (capacity_f / target_share_f)`. At 24x20 / 14x8 that was **5,080 records**
+  relation phrases being fixed templates, so the distinct-question capacity of a route is its
+  head kind's name vocabulary TIMES the usable terminal attributes on its leaf kind, and the
+  set ceiling is `min over families (capacity_f / target_share_f)`.
+  `scripts/13_rebalance_4hop.py::capacity_report()` is now the computation of record — it sums
+  that over `_ROUTES_TRAIN` from the live pools and prints **2-hop 8040 / 3-hop 7576 / 4-hop
+  8030**, so a build's headroom is computed rather than remembered. (The 20,080 figure below
+  used 8032 for 2-hop; the 8 records of difference are the single feature-headed route counted
+  with one terminal attribute instead of its leaf city's two, and it changes nothing.)
+  At 24x20 / 14x8 that was **5,080 records**
   (2-hop binding, capacity 2032 at a 40% share) and no number of seeds could pass it: 6000
   seeds gave 2280, 20000 gave 4027, 50000 gave 4907 = 97% of the ceiling. At 48x40 / 28x16 it
   is **20,080**. Two things do NOT cap it: `max_per_shape` (2000) never binds -- the largest
