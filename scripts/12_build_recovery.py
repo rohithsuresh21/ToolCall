@@ -23,11 +23,21 @@ this is meant to fix was measured at 4 hops, and 2-hop is already at 80.0% judge
 F1. A record that admits no genuine miss at any hop is skipped and the next one in
 the deterministic order takes its place, so the requested count is met exactly
 whenever supply allows.
+
+`--legacy-vocab` is REQUIRED for a base built before the 4x name-pool widening
+(`data/sft.jsonl`, `sft_r0`, `sft_r35`, `sft_r0_big`, `sft_r35_big`), because the
+pools are consumed through `rng.choice` and their length is part of the stream --
+so `build_world(seed)` no longer returns the world that record was minted in. The
+reconstruction check then fails and every record is left alone: measured 1/40 on
+`sft_r0` without the flag against 200/200 with it, and the run still exits 0 with
+a byte-identical copy of the base. That is why the rebuild-failure count is
+checked below and not merely printed.
 """
 from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import hashlib
 import json
 import random
@@ -40,6 +50,7 @@ sys.path.insert(0, str(REPO))
 
 from atr.data.recovery import RecoveryConfig, build_recovery  # noqa: E402
 from atr.tasks.generator import _hop_or_shorter  # noqa: E402
+from atr.tools.legacy_vocab import legacy_vocab  # noqa: E402
 from atr.tools.world import build_world  # noqa: E402
 
 
@@ -64,6 +75,9 @@ def main() -> None:
     ap.add_argument("--out", default="data/sft_r0_max_rec.jsonl")
     ap.add_argument("--rates", default="2:0.05,3:0.12,4:0.15",
                     help="share of each hop family converted to a recovery trajectory")
+    ap.add_argument("--legacy-vocab", action="store_true",
+                    help="narrow the name pools to their pre-widening prefixes; "
+                         "required for any base built before commit 566f4d2")
     ap.add_argument("--no-audit", action="store_true")
     args = ap.parse_args()
 
@@ -81,39 +95,43 @@ def main() -> None:
     flavours, at_hop, empties = collections.Counter(), collections.Counter(), 0
     n_recov = 0
     failed_rebuild, no_miss = 0, 0
-    for hop in sorted(by_hop):
-        idxs = by_hop[hop]
-        want = int(round(cfg.rate_by_hop.get(hop, 0.0) * len(idxs)))
-        # Deterministic candidate order: a hash of the task id, so the slice is
-        # reproducible and is not biased toward low seeds.
-        order = sorted(idxs, key=lambda i: hashlib.sha1(
-            rows[i]["meta"]["task_id"].encode()).hexdigest())
-        made = 0
-        for i in order:
-            if made >= want:
-                break
-            rec = rows[i]
-            prompt = next(m["content"] for m in rec["messages"] if m["role"] == "user")
-            task, world = _rebuild(rec["meta"]["task_id"], hop, prompt)
-            if task is None:
-                failed_rebuild += 1
-                continue
-            out = build_recovery(task, rec["messages"], cfg, world=world)
-            if out is None:
-                no_miss += 1
-                continue
-            rec["messages"] = out["messages"]
-            rec["meta"]["num_calls"] = rec["meta"].get("num_calls", 0) + 1
-            rec["meta"]["recovery"] = {"hop": out["hop"], "flavour": out["flavour"],
-                                       "num_results": out["num_results"],
-                                       "query": out["query"]}
-            flavours[out["flavour"]] += 1
-            at_hop[(hop, out["hop"])] += 1
-            empties += out["num_results"] == 0
-            made += 1
-            n_recov += 1
-        print(f"[{hop}-hop] {made}/{want} converted from {len(idxs)} records "
-              f"({made / len(idxs):.1%})")
+    ctx = legacy_vocab() if args.legacy_vocab else contextlib.nullcontext()
+    if args.legacy_vocab:
+        print("[vocab] pre-widening name pools (24x20 people, 14x8 orgs)")
+    with ctx:
+        for hop in sorted(by_hop):
+            idxs = by_hop[hop]
+            want = int(round(cfg.rate_by_hop.get(hop, 0.0) * len(idxs)))
+            # Deterministic candidate order: a hash of the task id, so the slice is
+            # reproducible and is not biased toward low seeds.
+            order = sorted(idxs, key=lambda i: hashlib.sha1(
+                rows[i]["meta"]["task_id"].encode()).hexdigest())
+            made = 0
+            for i in order:
+                if made >= want:
+                    break
+                rec = rows[i]
+                prompt = next(m["content"] for m in rec["messages"] if m["role"] == "user")
+                task, world = _rebuild(rec["meta"]["task_id"], hop, prompt)
+                if task is None:
+                    failed_rebuild += 1
+                    continue
+                out = build_recovery(task, rec["messages"], cfg, world=world)
+                if out is None:
+                    no_miss += 1
+                    continue
+                rec["messages"] = out["messages"]
+                rec["meta"]["num_calls"] = rec["meta"].get("num_calls", 0) + 1
+                rec["meta"]["recovery"] = {"hop": out["hop"], "flavour": out["flavour"],
+                                           "num_results": out["num_results"],
+                                           "query": out["query"]}
+                flavours[out["flavour"]] += 1
+                at_hop[(hop, out["hop"])] += 1
+                empties += out["num_results"] == 0
+                made += 1
+                n_recov += 1
+            print(f"[{hop}-hop] {made}/{want} converted from {len(idxs)} records "
+                  f"({made / len(idxs):.1%})")
 
     Path(args.out).write_text(
         "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")

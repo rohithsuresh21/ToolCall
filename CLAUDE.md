@@ -61,6 +61,13 @@ python scripts/13_rebalance_4hop.py  --out data/sft_r0_max_4h.jsonl    # mix 40/
 # 13_ prints the per-family distinct-question CAPACITY first and refuses a share that
 # exceeds it; both audit their output and both are byte-identical across runs.
 
+# the same two arms at 1/3.9 scale, on sft_r0 (2280) -- ~40 min of SFT each, not 2h15m.
+# --legacy-vocab is MANDATORY on any base built before the name-pool widening.
+BASE=data/sft_r0.jsonl
+python scripts/12_build_recovery.py --base $BASE --out data/sft_r0_rec.jsonl --legacy-vocab
+python scripts/13_rebalance_4hop.py --base $BASE --out data/sft_r0_4h.jsonl \
+    --legacy-vocab --seed-start 200000 --draws 4000
+
 # tokens/example with the real Qwen3-4B tokenizer and this repo's own renderer
 python scripts/token_stats.py data/sft_r0_max_rec.jsonl --spans   # --spans adds the masking check
 
@@ -666,9 +673,9 @@ realisations, undoing the change with no error anywhere.
 ## Conventions
 
 - `artifacts/` is gitignored except `artifacts/sft_sample.jsonl`. Committed data lives in
-  `data/sft.jsonl`, `data/judge_tasks.jsonl`, `data/musique_train_tasks.jsonl` and
-  `data/musique_chain_tasks.jsonl`. SFT records are `{messages, tools, meta}` JSONL, UTF-8.
-- **Eight committed SFT sets, and the difference between them is ONE variable each.**
+  `data/sft.jsonl`, the `sft_r*` arms, `data/judge_tasks.jsonl`,
+  `data/musique_train_tasks.jsonl` and `data/musique_chain_tasks.jsonl`. SFT records are `{messages, tools, meta}` JSONL, UTF-8.
+- **Ten committed SFT sets, and the difference between them is ONE variable each.**
   `data/sft.jsonl` (2280 records) is the v3 set with NO reasoning — the pre-`<think>`
   baseline. `data/sft_r0.jsonl` (2280) is the same synthetic population WITH `<think>`, and
   `data/sft_r35.jsonl` (3508 = the identical 2280 synthetic + 1228 real at 35.0%) adds real
@@ -728,6 +735,40 @@ realisations, undoing the change with no error anywhere.
   1332 new 4-hop**. Both audit CLEAN on all five axes and both are byte-identical across two
   full runs. The 2-hop slice of `_4h` is a deterministic hash-ordered subset of `r0_max`'s, so
   it is a sub-sample and not a re-draw.
+- **`sft_r0_rec` and `sft_r0_4h` are the same two transforms at 1/3.9 scale, on `sft_r0`, and
+  they exist to be trainable in one session.** 2280 records is ~40 min of SFT against 2h15m
+  for the 8880-record `r0_max` arms, so both can be read against `r0`'s known 54.6% without
+  waiting a day between them. Same scripts, same gates, same invariants, and both audit CLEAN
+  on all five axes and are byte-identical across two full runs.
+  `data/sft_r0_rec.jsonl` (2280) converts 231 records (10.1%) at the same 5/12/15% per-family
+  rates — 46 / 82 / 103 — leaving **2049 lines verbatim**, +2 messages each, task ids, hop mix
+  and questions unchanged. Every requested conversion succeeded: 0 rebuild failures, 0 records
+  with no genuine miss. Realised flavour mix wrong_entity 41.6% / conversational 35.9% /
+  absent_entity 22.5% / wrong_keyword 0%, and 1.3% of the bad calls came back empty — the same
+  shape as `r0_max_rec`, which is the point of running the small arm at all.
+  `data/sft_r0_4h.jsonl` (2280) shifts 40/30/30 -> **25/30/45** at the same count: 570 / 684 /
+  1026, **1938 lines verbatim, delta exactly 342 new 4-hop** minted from seeds 200k+ (disjoint
+  from `r0`'s 0..6k, from dev 900k+ and from GRPO 1M+; a range distinct from the 100k+ that
+  `r0_max_4h` used, so the two 4-hop top-ups stay tellable apart).
+- **A base built before the name-pool widening needs `--legacy-vocab`, and without it the
+  recovery arm fails SILENTLY.** Both transforms rebuild the Task behind a record from its
+  `task_id` to execute against the corpus that episode really ran on, and `build_world` draws
+  names through `rng.choice` — so the 4x widening re-pointed every seed and the reconstruction
+  now misses. Measured on `sft_r0`: **1/40 records rebuilt** under the live pools, 200/200
+  under `atr.tools.legacy_vocab.legacy_vocab()`. `12_build_recovery.py` treats a failed rebuild
+  as "leave this record alone", so the run would have exited 0 having written a byte-identical
+  copy of its base with zero recovery trajectories in it. It now raises when more than half the
+  candidates fail to rebuild, and names the flag. The widening was pure APPEND on all four
+  pools, which is what makes the restore exact: `legacy_vocab()` truncates to the legacy prefix
+  and asserts it rather than carrying a second copy of the strings. It is a context manager and
+  never a module-level switch — a set BUILT under narrowed pools would be indistinguishable
+  from a pre-widening one, and nothing here re-opens that one-way door for `generate()`.
+  `13_rebalance_4hop.py` takes the same flag because capacity is a property of the vocabulary
+  the base was drawn from, and `_VOCAB` had to stop being a module-level snapshot for that to
+  work: **4-hop capacity is 2030 at the legacy pools against 8030 at the live ones**, so
+  reading the live number for a legacy base would wave through a share that cannot be minted.
+  At 25/30/45 the legacy ceiling is 4,511 records, 4-hop binding; 2280 asks 1026 of the 2030,
+  50.5% saturation, and 4000 seeds yielded 807 new questions against the 342 needed.
 - **The synthetic ceiling is head-entity VOCABULARY, and it is ~4x the record count you want.**
   A question names only its HEAD entity (`"What is the {attr} of {nested phrase}({head})?"`),
   relation phrases being fixed templates, so the distinct-question capacity of a route is its

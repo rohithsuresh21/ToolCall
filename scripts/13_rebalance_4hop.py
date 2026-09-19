@@ -23,11 +23,21 @@ name vocabulary times the number of usable terminal attributes on its leaf kind
 passage, same number by construction, so the gate rejects it everywhere).
 `capacity_report()` sums that over the train route pool, which is what says
 whether a requested share is reachable at all before any seeds are spent.
+
+CAPACITY IS A PROPERTY OF THE VOCABULARY THE BASE SET WAS BUILT AGAINST, so
+`--legacy-vocab` moves it as well as the mint. The 4x name-pool widening
+(commit 566f4d2) took 4-hop capacity from 2030 to 8030; a base built before it --
+`data/sft.jsonl`, `sft_r0`, `sft_r35`, `sft_r0_big`, `sft_r35_big` -- has to be
+topped up from the SAME pools it was drawn from, or the new 4-hop slice carries
+names the rest of the set cannot contain and the mix stops being the only
+variable. Reading the live 8030 for such a base would also wave through a share
+that is unreachable, so the flag is checked before any seeds are spent.
 """
 from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import hashlib
 import json
 import random
@@ -46,17 +56,24 @@ from atr.data.teacher import collect_oracle  # noqa: E402
 from atr.tasks.generator import (_LEAF_ATTR, _REL, _ROUTES_TRAIN,  # noqa: E402
                                  generate)
 from atr.tools import world as W  # noqa: E402
+from atr.tools.legacy_vocab import legacy_vocab  # noqa: E402
 
-# Distinct NAMES each entity kind can carry across all worlds. These are the
-# pools build_world draws from, not the 6/8/10 it instantiates per world.
-_VOCAB = {
-    "person": len(W.PERSON_FIRST) * len(W.PERSON_LAST),
-    "organisation": len(W.ORG_WORDS) * len(W.ORG_KIND),
-    "work": len(W.WORK_WORDS),
-    "city": len(W.NATIONS),
-    "country": len(W.NATIONS),
-    "feature": len(W.GEO_FEATURES),
-}
+def _vocab() -> dict[str, int]:
+    """Distinct NAMES each entity kind can carry across all worlds -- the pools
+    build_world draws from, not the 6/8/10 it instantiates per world.
+
+    Read at CALL time, never snapshotted at import: `legacy_vocab()` narrows these
+    lists in place, and a module-level dict would have been computed against the
+    live pools before the context manager ever ran, silently reporting the widened
+    8030 for a set whose real 4-hop capacity is 2030."""
+    return {
+        "person": len(W.PERSON_FIRST) * len(W.PERSON_LAST),
+        "organisation": len(W.ORG_WORDS) * len(W.ORG_KIND),
+        "work": len(W.WORK_WORDS),
+        "city": len(W.NATIONS),
+        "country": len(W.NATIONS),
+        "feature": len(W.GEO_FEATURES),
+    }
 # leaf kind -> terminal attributes that actually survive the gates.
 _DEAD = {("country", "population")}   # leaks through the capital's passage
 
@@ -71,11 +88,12 @@ def _usable_attrs(kind: str) -> int:
 
 def capacity_report() -> dict[int, int]:
     """Distinct questions each hop family can mint, summed over the train routes."""
+    vocab = _vocab()
     out = {}
     for hops, routes in sorted(_ROUTES_TRAIN.items()):
         total = 0
         for r in routes:
-            total += _VOCAB.get(_REL[r[0]][0], 0) * _usable_attrs(_leaf_kind(r))
+            total += vocab.get(_REL[r[0]][0], 0) * _usable_attrs(_leaf_kind(r))
         out[hops] = total
     return out
 
@@ -96,12 +114,24 @@ def main() -> None:
                     help="4-hop seeds to draw for the top-up")
     ap.add_argument("--max-steps", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--legacy-vocab", action="store_true",
+                    help="narrow the name pools to their pre-widening prefixes; "
+                         "required for any base built before commit 566f4d2")
     ap.add_argument("--no-audit", action="store_true")
     args = ap.parse_args()
 
     target = {int(k): float(v) for k, v in (p.split(":") for p in args.mix.split(","))}
     rng = random.Random(args.seed)
 
+    ctx = legacy_vocab() if args.legacy_vocab else contextlib.nullcontext()
+    if args.legacy_vocab:
+        print("[vocab] pre-widening name pools (24x20 people, 14x8 orgs) -- "
+              "capacity AND the top-up mint both read them")
+    with ctx:
+        _build(args, target, rng)
+
+
+def _build(args, target, rng) -> None:
     cap = capacity_report()
     print("distinct-question capacity per hop family (head vocabulary x usable "
           "terminal attributes, summed over the train routes):")
