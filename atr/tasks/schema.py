@@ -157,7 +157,8 @@ such other did does do done can could would should will may might must
 """.split())
 
 
-def psychic_caps(query: str, prompt: str, prose: bool = False) -> list[str]:
+def psychic_caps(query: str, prompt: str, prose: bool = False,
+                 extra_non_entity: frozenset = frozenset()) -> list[str]:
     """Capitalised tokens in `query` that the `prompt` does not contain -- i.e. the
     proper nouns a model would have had to invent to write this text.
 
@@ -180,14 +181,19 @@ def psychic_caps(query: str, prompt: str, prose: bool = False) -> list[str]:
     the entity itself, which is exactly what the check must still see. The cost of
     `prose=True` is that a one-word invented entity opening a sentence would be
     missed -- which is why no template in atr/data/reasoning.py opens a sentence
-    with an entity, and why tests/test_real_chains.py asserts that it never does."""
+    with an entity, and why tests/test_real_chains.py asserts that it never does.
+
+    `extra_non_entity` widens the function-word exclusion WITHOUT forking the
+    definition -- `teacher_caps` below passes the closed-class words an LLM writes
+    that this repo's own templates never do. One implementation, still."""
     low = (prompt or "").lower()
     out = []
     for m in re.finditer(r"[A-Za-z]+", query or ""):
         tok = m.group(0)
         if not tok[:1].isupper():
             continue
-        if tok.lower() in _NON_ENTITY_CAPS or tok.lower() in low:
+        if (tok.lower() in _NON_ENTITY_CAPS or tok.lower() in extra_non_entity
+                or tok.lower() in low):
             continue
         if prose:
             before = (query or "")[:m.start()].rstrip()
@@ -195,6 +201,61 @@ def psychic_caps(query: str, prompt: str, prose: bool = False) -> list[str]:
                 continue
         out.append(tok)
     return out
+
+
+# Closed-class words an LLM opens a sentence with that this repo's own templates
+# never do. They exist because TEACHER-WRITTEN <think> prose cannot be read with
+# `prose=True`.
+#
+# `prose=True` ignores SENTENCE-INITIAL capitals, and that blind spot is safe only
+# while we author the templates ourselves -- atr/data/reasoning.py is forbidden from
+# opening a sentence with a bare entity name and test_real_chains.py pins it. A
+# teacher obeys no such rule: "Tucson is the second largest city" is the first thing
+# it writes, and `prose=True` cannot see the invented name sitting in slot one. So
+# teacher text is read at `prose=False`, where every capital counts.
+#
+# The cost of that strictness is false positives on ordinary sentence openers, and
+# it is not small: `prose=False` flags 32.9% of the SHIPPED, clean blocks of
+# sft_r0_max. Measured, the whole 32.9% is five tokens -- Now (1978), My (1020),
+# Step (1020), One (963), So (881) -- all closed-class. With this set added,
+# `prose=False` flags 0 of all 43,512 blocks of sft_r0_max. That zero is what makes
+# the strict gate usable on generated prose; re-run it if the templates change.
+_TEACHER_EXTRA_CAPS = frozenset("""
+now my step one so given since because both neither next first second third
+fourth looking here there also finally still only note if once each every no yes
+""".split())
+
+_NUM_RUN = re.compile(r"\d[\d,]*")
+
+
+def teacher_caps(text: str, prompt: str) -> list[str]:
+    """Proper nouns in LLM-written <think> prose that the prompt does not contain.
+
+    The strict reading of `psychic_caps` -- no sentence-initial exemption -- with
+    the closed-class openers above excused. Use this for any reasoning block this
+    repo did not write itself; use `psychic_caps(prose=True)` for the templated
+    ones, whose sentence-initial slot is already guarded by construction.
+
+    Like `psychic_caps` it only answers "is this name in the PROMPT"; the caller
+    accumulates the tool_responses seen so far and checks those too, exactly as
+    tests/audit_sft.py axis 5 does."""
+    return psychic_caps(text, prompt, prose=False,
+                        extra_non_entity=_TEACHER_EXTRA_CAPS)
+
+
+def unseen_numbers(text: str, seen_norm: str) -> list[str]:
+    """Numeric literals in `text` that do not occur in the episode's seen prose.
+
+    `psychic_caps` scans `[A-Za-z]+` and so is BLIND to digits: a teacher writing
+    "founded in 1977" when no passage said so passes every capitalisation check
+    there is. A templated block could not invent a number -- it only ever echoes
+    `{ans}`, which the terminal read returned -- so this gate scores 0 of 43,512 on
+    sft_r0_max and is pure headroom for generated prose.
+
+    `seen_norm` is `norm_text` of the prompt plus every STRICTLY EARLIER
+    tool_response's title+text, i.e. the same accumulator the auditor builds."""
+    return [d for d in _NUM_RUN.findall(text or "")
+            if norm_text(d) and norm_text(d) not in seen_norm]
 
 
 # ---------------------------------------------------------------------------
